@@ -1592,7 +1592,15 @@ int64_t ui_get_pan_offset_hz(void) { return sv_effective() ? s_sv_pan_hz
  * the view inside the capture window drags it with the dial and there is no
  * still display left. Tuning away from here still holds the view and lets the
  * hatching grow, which is the behaviour he approved. */
-static void sv_frame_on_capture(void)
+/* The pan sv_frame_on_capture() WOULD apply, without applying it.
+ *
+ * Split out for the band-plan drag, which has to draw the window where it is
+ * GOING to land rather than where it would be if the view followed the dial.
+ * Before this the drag previewed one thing and the release produced another,
+ * and the operator saw the window spring back the instant he lifted his finger
+ * ("it does not stop where i left it but bounces off that position"). A
+ * preview is only honest if it runs the same arithmetic the commit will. */
+static int64_t sv_pan_on_capture(void)
 {
     int32_t span   = (int32_t)((double)DSP_SAMPLE_RATE_HZ / (double)s_zoom_factor + 0.5);
     int64_t cap_hi = (int64_t)ui_get_if_offset_hz();          /* relative to the dial */
@@ -1600,7 +1608,12 @@ static void sv_frame_on_capture(void)
     int64_t lo     = -(int64_t)span / 2;                      /* dial-centred */
     if (lo + span > cap_hi) lo = cap_hi - span;
     if (lo < cap_lo)        lo = cap_lo;
-    sv_apply_pan_hz(lo + span / 2);
+    return lo + span / 2;
+}
+
+static void sv_frame_on_capture(void)
+{
+    sv_apply_pan_hz(sv_pan_on_capture());
 }
 
 /* ⭐ A JUMP IS NOT TUNING, AND SIZE ALONE CANNOT TELL THEM APART (Roy KI0ER,
@@ -1623,19 +1636,58 @@ static void sv_frame_on_capture(void)
  * is wrong for a JUMP, where they have named a frequency and want to see it.
  * So the caller says which it was, rather than the arithmetic guessing. */
 static bool s_sv_jump_pending = false;
+static bool s_sv_reframe_pending = false;
 
 void ui_note_frequency_jump(void)
 {
     s_sv_jump_pending = true;
 }
 
+/* ⛔ STRONGER THAN ui_note_frequency_jump(), AND THE DIFFERENCE IS THE SUBJECT
+ * OF THE GESTURE.
+ *
+ * A jump asks "does the new passband still fit inside the view I am holding?"
+ * and holds if it does - right for a spot pick, where the operator named a
+ * FREQUENCY and the picture should move only if it must.
+ *
+ * The band-plan knob is not that. The knob IS the visible window - it is drawn
+ * as a frame around the span currently on the spectrum precisely so it reads as
+ * a grab-and-slide handle - so a drag of it is direct manipulation of the
+ * window itself. Holding the window still while the finger slides it is the one
+ * outcome the gesture cannot have, and that is what shipped: the drag wrote the
+ * DIAL, the still display faithfully held the view, and the operator watched
+ * the box jump back to where it started while the marker and passband were left
+ * at whichever edge of it the new dial fell on. Reported 2026-09-18: "i would
+ * expect the slider comprising the visible spectrum + freq and BW to move
+ * together: It doesn't".
+ *
+ * So this re-frames unconditionally. The still display keeps its hold policy
+ * for every way of TUNING; only a gesture whose subject is the window itself
+ * moves the window. */
+void ui_note_view_reframe(void)
+{
+    s_sv_reframe_pending = true;
+}
+
 static void still_view_follow_dial(uint32_t prev_hz, uint32_t now_hz)
 {
     int64_t d = (int64_t)now_hz - (int64_t)prev_hz;
-    const bool jumped = s_sv_jump_pending;
+    const bool jumped  = s_sv_jump_pending;
+    const bool reframe = s_sv_reframe_pending;
     s_sv_jump_pending = false;      /* consumed either way - a stale flag would
                                      * re-frame on some later ordinary tune */
+    s_sv_reframe_pending = false;   /* same reasoning - see ui_note_view_reframe */
     if (d == 0) return;
+
+    /* The window itself was dragged (band-plan knob): it must land where the
+     * finger left it, so there is no fits-test and no push/land policy to run -
+     * just re-frame. See ui_note_view_reframe(). */
+    if (reframe) {
+        s_sv_push = 0; s_sv_side = 0;
+        sv_frame_on_capture();
+        dsp_set_zoom(s_zoom_factor, s_pan_offset_bins, ui_get_if_bin_shift(DSP_FFT_SIZE));
+        return;
+    }
 
     /* A jump larger than the whole captured window - band change, memory
      * recall - leaves nothing on screen worth holding still. */
@@ -2244,7 +2296,13 @@ static bool     s_tune_mode_locked  = false; // once 250ms passes without pannin
 // Passband fade-in after pan settles
 static uint64_t s_passband_fade_start_us = 0;  // when passband fade began, 0 if not fading
 static bool s_hide_passband_now = false;       // immediately hide on pan settle, before fade kicks in
-#define PASSBAND_FADE_DELAY_MS 1000         // delay before fade starts
+/* Halved from 1000 on the operator's call, 2026-09-18: with the band-plan drag
+ * now moving the dial with the window, the hidden passband is what SHOWS that
+ * the dial came along - "i like it as it shows that the dial also moved on the
+ * band.... however, its a bit slow fading in again". Shared with the spectrum's
+ * own passband tint after a pan settle, which is the same gesture and the same
+ * reason to come back promptly. */
+#define PASSBAND_FADE_DELAY_MS 500          // delay before fade starts
 #define PASSBAND_FADE_DURATION_MS 1000      // fade-in duration (after delay)
 // One-finger hold for tune: only tunes if held still >= TUNE_HOLD_MS.
 static uint64_t s_touch_down_us     = 0;    // timestamp of last PRESSED event
@@ -2348,7 +2406,23 @@ static lv_obj_t *s_bandplan_obj  = NULL;
 // Invisible touch extension ABOVE the band plan (operator, 2026-08-23: the
 // 22 px strip is "super difficult to land on"). Tap-to-tune gives up these
 // pixels; the waterfall is 370 px tall and can spare them.
-#define BP_CATCH_PX 50
+//
+// ⭐ 50 -> 92 px on 2026-09-18, and the number is stated in MILLIMETRES because
+// that is what a finger is. The operator asked for "a 8mm point to tune free
+// band above the band-plan strip where the box/slider can be grabbed ... Most
+// user will always point to tune higher up the wf anyways".
+//
+// The Tab5 panel is 5.0" at 1280x720, so the diagonal is 127 mm, the long edge
+// is 127 x 16/sqrt(16^2+9^2) = 110.7 mm, and the pixels are square:
+//     1280 / 110.7 = 11.56 px/mm   ->   8 mm = 92 px
+// Grab height end to end is then 92 + BANDPLAN_H = 114 px, just under 10 mm.
+//
+// 50 px was 4.3 mm, which is below every touch-target guideline going (iOS 44 pt
+// ~ 7 mm, Material 48 dp ~ 7.6 mm) - so "difficult to grab" was the predictable
+// outcome and raising it is not a matter of taste. It matters more now than in
+// August: the knob is a DRAG target, not a tap target, so a miss does not just
+// fail, it starts a tune-to-dial gesture instead.
+#define BP_CATCH_PX 92
 static lv_obj_t *s_bp_catch      = NULL;
 static lv_obj_t *s_bp_seg[BANDPLAN_MAX_SEG];
 static lv_obj_t *s_bp_seg_lbl[BANDPLAN_MAX_SEG];
@@ -2374,6 +2448,16 @@ static lv_obj_t *s_bp_knob       = NULL;  // bordered box framing the marker so 
 // never reaches the spectrum gesture code at all.
 static bool      s_touch_on_bandplan   = false;
 static bool      s_bp_dragging         = false;
+/* Where the visible-span window will BE once the drag is committed. Held for
+ * the duration of the drag so update_bandplan_strip() draws the box at its
+ * landing place rather than where the still display would put it - the two
+ * differ by exactly the drag distance, which is what used to make the box
+ * spring back on release. See bp_solve_view(). */
+static int64_t   s_bp_preview_pan_hz   = 0;
+/* The band-plan drag moves the WINDOW, so what it tracks is the view centre,
+ * not a dial frequency. See bp_solve_view(). */
+static int64_t   s_bp_drag_start_view_hz = 0;
+static int64_t   s_bp_drag_view_hz       = 0;
 static lv_point_t s_bp_drag_start_pt;
 static int64_t   s_bp_drag_start_freq  = 0;
 static uint32_t  s_bp_drag_band_lo     = 0;
@@ -2419,6 +2503,7 @@ static lv_obj_t *s_bot_wifi_ip = NULL;
 static lv_coord_t s_bot_wifi_min_x = 0;  /* leftmost x the WiFi zone may use (clock's right edge) */
 static lv_obj_t *s_bot_version = NULL; /* firmware version, between battery and clock */
 static lv_obj_t *s_bot_diag_dot = NULL; /* static green dot, shown while a microSD card is mounted */
+static lv_obj_t *s_bot_sd_slash = NULL; /* diagonal stroke over the SD dot+label when NO card is in */
 static lv_obj_t *s_bot_diag_label = NULL; /* "SD" text next to the dot, shown/hidden together with it */
 // Desired microSD-dot state, set by ui_set_sd_active() (called from the
 // sd_archive task) and reconciled on the LVGL thread in sim_border_keepalive_cb.
@@ -2427,7 +2512,7 @@ static lv_obj_t *s_bot_diag_label = NULL; /* "SD" text next to the dot, shown/hi
 // the UI is busy, that single lock timed out, and with no retry the dot never
 // appeared for the whole session. Reconciling on an LVGL-thread timer is
 // lock-free and self-correcting within ~1 s.
-static volatile int8_t s_sd_want = -1;
+static volatile int8_t s_sd_want = 0;   /* 0 = no card, which is the truth until sd_archive says otherwise */
 static lv_obj_t *s_burger_btn = NULL;  // right-edge drawer grip handle (kept for foreground move after all UI built)
 static lv_obj_t *s_left_edge_grip = NULL;
 static lv_obj_t *s_bottom_edge_grip = NULL;
@@ -2565,13 +2650,41 @@ static void output_power_area_refresh(void)
     if (s_outpwr_cal_btn) lv_obj_add_flag(s_outpwr_cal_btn, LV_OBJ_FLAG_HIDDEN);
     if (s_outpwr_recal_btn) lv_obj_clear_flag(s_outpwr_recal_btn, LV_OBJ_FLAG_HIDDEN);
 
-    int idx = 0;   // default: the lowest calibrated level - nothing persisted yet
+    // ⛔ USED TO DEFAULT TO THE LOWEST CALIBRATED STEP WHEN NOTHING WAS
+    // PERSISTED YET - which is exactly the state right after Calibrate Power
+    // finishes, since calibration only measures the voltage->watts curve and
+    // never sets a target of its own. This function's own write below
+    // (cat_request_pa_voltage_x10) then fired unconditionally, so the radio's
+    // real Max. PA voltage was silently dropped to minimum the moment the
+    // drawer refreshed - not just a UI default, an actual unrequested
+    // transmit-power cut. Gyula HA3HZ, 2026-09-17: "I didn't notice the
+    // slider after calibration and couldn't figure out why my output power
+    // was so low."
+    //
+    // Fixed by reflecting the radio's OWN CURRENT voltage when nothing is
+    // persisted, instead of assuming a value - Calibrate Power already
+    // restores the pre-calibration voltage on its way out, so this now finds
+    // the calibrated step closest to what the radio is ALREADY at, making the
+    // write below a no-op rather than a silent cut. If that voltage is not
+    // known yet (cat_get_pa_voltage_x10() == -1, nothing has answered), fall
+    // back to the HIGHEST calibrated step - the wrong-direction mistake here
+    // is "louder than expected", never "silently far too quiet".
+    int idx = s_outpwr_n - 1;
     uint16_t target_w;
     if (band && band[0] && settings_get_pwr_target_watts(band, &target_w)) {
         int best_gap = 0x7FFFFFFF;
         for (int k = 0; k < s_outpwr_n; k++) {
             int gap = abs((int)s_outpwr_w[k] - (int)target_w);
             if (gap < best_gap) { best_gap = gap; idx = k; }
+        }
+    } else {
+        int16_t cur_x10 = cat_get_pa_voltage_x10();
+        if (cur_x10 >= 0) {
+            int best_gap = 0x7FFFFFFF;
+            for (int k = 0; k < s_outpwr_n; k++) {
+                int gap = abs((int)s_outpwr_v[k] - (int)cur_x10);
+                if (gap < best_gap) { best_gap = gap; idx = k; }
+            }
         }
     }
 
@@ -3103,7 +3216,6 @@ void ui_drawer_map_set(uint64_t basic_mask, uint64_t adv_mask)
     }
 }
 
-static lv_obj_t *s_switch_otadl = NULL;
 static lv_obj_t *s_expert_btn = NULL, *s_expert_lbl = NULL;
 
 static bool      s_drawer_expert = false;
@@ -3264,6 +3376,7 @@ static lv_obj_t *s_lbl_wf_black = NULL;
 static lv_obj_t *s_slider_wf_contrast = NULL;
 static lv_obj_t *s_lbl_wf_contrast = NULL;
 static lv_obj_t *s_dropdown_wf_window = NULL;
+static lv_obj_t *s_dropdown_wf_speed = NULL;
 static lv_obj_t *s_dropdown_spur      = NULL;
 static lv_obj_t *s_tune_tooltip  = NULL;  // freq label above finger during tap-to-tune
 static lv_obj_t *s_bw_label      = NULL;  // passband width in top bar
@@ -3379,7 +3492,6 @@ static void drawer_term_btn_cb(lv_event_t *e);
 static void topbar_reconcile_cb(lv_timer_t *t);
 static void drawer_slider_cwtxoff_cb(lv_event_t *e);
 static void ui_set_cw_tx_offset_label(int hz);
-static void drawer_otadl_cb(lv_event_t *e);
 static void drawer_expert_btn_cb(lv_event_t *e);
 static void drawer_expert_paint(void);
 static void drawer_check_flip_cb(lv_event_t *e);
@@ -3397,6 +3509,7 @@ static void drawer_slider_cwaudio_vol_cb(lv_event_t *e);
 static void drawer_slider_wf_black_cb(lv_event_t *e);
 static void drawer_slider_wf_contrast_cb(lv_event_t *e);
 static void drawer_dropdown_wf_window_cb(lv_event_t *e);
+static void drawer_dropdown_wf_speed_cb(lv_event_t *e);
 static void drawer_dropdown_spur_cb(lv_event_t *e);
 static int  spur_mode_to_menu_idx(uint8_t mode);
 bool ui_get_flat_mode(void);
@@ -3703,17 +3816,22 @@ static void sim_border_keepalive_cb(lv_timer_t *t)
         static int8_t s_sd_applied = -1;
         if (s_sd_want != s_sd_applied) {
             s_sd_applied = s_sd_want;
-            bool want_show = (s_sd_want != 0);
-            if (want_show) {
-                // GREEN = mirroring live, YELLOW = boot backup written but live
-                // mirroring unavailable while WiFi is on.
-                lv_obj_set_style_bg_color(s_bot_diag_dot,
-                        lv_color_hex(s_sd_want == 1 ? 0x30D030 : 0xE0C020), 0);
-                lv_obj_clear_flag(s_bot_diag_dot, LV_OBJ_FLAG_HIDDEN);
-                if (s_bot_diag_label) lv_obj_clear_flag(s_bot_diag_label, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_add_flag(s_bot_diag_dot, LV_OBJ_FLAG_HIDDEN);
-                if (s_bot_diag_label) lv_obj_add_flag(s_bot_diag_label, LV_OBJ_FLAG_HIDDEN);
+            // Three colours, never hidden. GREEN = mirroring live, YELLOW = boot
+            // backup written but live mirroring unavailable while WiFi is on,
+            // GREY + a stroke through it = no card in the slot.
+            const bool no_card = (s_sd_want == 0);
+            // ⛔ THE DOT CARRIES THE COLOUR, THE "SD" LABEL NEVER DOES.
+            // Colouring both was tried and rejected on sight - operator,
+            // 2026-09-18: "please keep the dot yellow only". The label is a
+            // name, not a state; two things saying the same thing in the same
+            // colour just makes the bar shout.
+            uint32_t col = no_card    ? UI_COLOR_TEXT_SECONDARY
+                         : (s_sd_want == 1) ? 0x30D030
+                                            : 0xE0C020;
+            lv_obj_set_style_bg_color(s_bot_diag_dot, lv_color_hex(col), 0);
+            if (s_bot_sd_slash) {
+                if (no_card) lv_obj_clear_flag(s_bot_sd_slash, LV_OBJ_FLAG_HIDDEN);
+                else         lv_obj_add_flag(s_bot_sd_slash, LV_OBJ_FLAG_HIDDEN);
             }
         }
     }
@@ -5054,7 +5172,8 @@ static void update_bandplan_strip(uint32_t freq_hz)
         /* Same exact pan the trace is drawn with (see sv_apply_pan_hz) - deriving it
      * from the rounded bin count here would let the labels creep against the
      * signals by up to half a bin. */
-    int32_t pan_hz  = (int32_t)ui_get_pan_offset_hz();
+    int32_t pan_hz  = (int32_t)(s_bp_dragging ? s_bp_preview_pan_hz
+                                                 : ui_get_pan_offset_hz());
         int64_t center  = (int64_t)freq_hz + pan_hz;
         int64_t vis_lo  = center - span_hz / 2;
         int64_t vis_hi  = center + span_hz / 2;
@@ -5121,6 +5240,137 @@ static void update_bandplan_strip(uint32_t freq_hz)
     if (s_bp_knob && !lv_obj_has_flag(s_bp_knob, LV_OBJ_FLAG_HIDDEN)) {
         lv_obj_move_foreground(s_bp_knob);
     }
+}
+
+/* ⭐ THE BAND-PLAN KNOB MOVES THE WINDOW, NOT THE DIAL.
+ *
+ * It was a tune control: the drag wrote a frequency and the visible-span box
+ * was redrawn wherever the still display then decided to put it. Two rounds of
+ * bench reports killed that reading. Dragging the box a little "does not leave
+ * it where i left it - it bounces back but moved the dial instead", and what
+ * the operator wants is the plain one: "I want the box (spectrum) always to
+ * follow and stay where i drag it to - no matter a little or a big jump. Dial +
+ * BW can stay on freq as long as the box is not dragged more than it can show
+ * in the new position" (2026-09-18).
+ *
+ * So the knob is a PAN control with a retune as its overflow:
+ *   - move the pan, leaving the dial and the passband exactly where they are;
+ *   - if the requested window is further from the dial than the radio can hear,
+ *     take the dial along by EXACTLY the shortfall, so the box still lands
+ *     where it was dropped.
+ * A small drag therefore never touches the radio, and a big one tunes only as
+ * much as it must. The bound is the same one the spectrum's own swipe-to-pan
+ * uses - the view CENTRE stays inside the capture window, so at least half the
+ * screen is real spectrum - deliberately the same number, because the two
+ * gestures do the same thing and disagreeing would be a bug in waiting.
+ *
+ * ⛔ A TAP IS STILL A TUNE, and that asymmetry is deliberate: it is the split
+ * the spectrum already makes (tap to tune, swipe to look), and pointing at a
+ * place in the band means "go there", while dragging the window means "look
+ * there". Do not unify them.
+ *
+ * Pure - no state written - so the drag PREVIEW and the release can run the
+ * identical arithmetic. A preview that predicts something else is what produced
+ * the bounce in the first place. */
+static void bp_solve_view(int64_t view_center_hz, uint32_t *dial_out, int64_t *pan_out)
+{
+    /* ⭐ THE PAN IS PRESERVED EXACTLY, AND THAT IS THE WHOLE RULE.
+     *
+     * Whatever offset the dial had inside the window before the drag, it has
+     * after it: the box, the VFO marker and the passband translate together as
+     * one rigid object. Operator, 2026-09-18: "we need to let the dial follow
+     * the pan exactly as it were before panning."
+     *
+     * ⛔ THIS REPLACED A PAN-FIRST-RETUNE-ONLY-IF-FORCED SOLVER, AND THE REASON
+     * IT WENT IS WORTH KEEPING. That version left the radio alone while the
+     * requested window was inside what it can hear, which sounds like exactly
+     * what a still display wants - but the QMX puts the VFO at +12 kHz in a
+     * +/-24 kHz baseband, so the reachable spectrum is dial-36k..dial+12k.
+     * Three times as much room below the dial as above it. Dragging left moved
+     * the box 40 kHz with the dial untouched; dragging right ran out after a
+     * few kHz and then dragged the dial along welded to the box's left edge.
+     * Measured and predicted, not a surprise - but "a strange manner" to use,
+     * and the asymmetry is the radio's, so no amount of tuning fixes it.
+     *
+     * The window onto the band is 48 kHz wide however it is placed, so panning
+     * without the dial buys very little and costs that asymmetry. The dial
+     * comes along instead.
+     *
+     * Pure - no state written - so the drag PREVIEW and the release run the
+     * identical arithmetic. A preview that predicts something else is what
+     * produced the original bounce. */
+    int64_t pan = sv_effective() ? ui_get_pan_offset_hz() : 0;
+
+    /* The DIAL lands on a whole kHz; the box therefore lands within 500 Hz of
+     * where it was dropped, which at band scale is under two pixels. Snapping
+     * the box instead would drift the pan by the remainder on every drag. */
+    int64_t d = ((view_center_hz - pan) + 500) / 1000 * 1000;
+
+    uint32_t lo, hi;
+    if (legal_band_edges(s_last_qmx_freq_hz, &lo, &hi)) {
+        if (d < (int64_t)lo) d = (int64_t)lo;
+        if (d > (int64_t)hi) d = (int64_t)hi;
+    }
+    *dial_out = (uint32_t)d;
+    *pan_out  = pan;                 /* unchanged, by construction */
+}
+
+/* ⛔ THE WEB MUST NOT APPLY THIS ON ITS OWN TASK.
+ *
+ * ui_bandplan_move_view() drives LVGL objects, reads the whole settings struct
+ * (via update_bandplan_strip) and reconfigures the zoom FFT. httpd runs at
+ * priority 5 with a 10 KB stack; taskLVGL is 4. Both halves of that are
+ * documented hazards in this project - a priority above 4 touching the display
+ * path is what lent taskLVGL priority 10 and starved the USB audio, and a
+ * multi-kilobyte settings struct on a small task stack is the fault that has
+ * now landed four times, once on this very task.
+ *
+ * So the web endpoint QUEUES and the LVGL thread applies, which is the pattern
+ * already used for the keyboard queue and for cat.c's pending CAT writes. One
+ * slot, last-writer-wins: a drag sends exactly one request on release, and if
+ * two ever raced, the newer one is the one the operator asked for. */
+static volatile int64_t s_bp_view_req_hz = 0;
+static volatile bool    s_bp_view_req    = false;
+
+void ui_request_bandplan_view(int64_t view_center_hz)
+{
+    s_bp_view_req_hz = view_center_hz;
+    s_bp_view_req    = true;
+}
+
+static void bp_view_q_drain_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_bp_view_req) return;
+    s_bp_view_req = false;
+    ui_bandplan_move_view(s_bp_view_req_hz);
+}
+
+uint32_t ui_bandplan_move_view(int64_t view_center_hz)
+{
+    uint32_t dial = 0;
+    int64_t  pan  = 0;
+    bp_solve_view(view_center_hz, &dial, &pan);
+
+    if (dial != s_last_qmx_freq_hz) {
+        cat_set_frequency_forced(dial);   /* deliberate - never rate-limited away */
+        /* This runs still_view_follow_dial(), which moves the pan to hold the
+         * same absolute frequencies. We want a DIFFERENT pan, so it is
+         * overwritten immediately below - calling it anyway is what keeps every
+         * other consumer (axis, cursor, spots lane, waterfall anchor) in step. */
+        ui_update_frequency(dial);
+    }
+    if (sv_effective() && pan != ui_get_pan_offset_hz()) {
+        sv_apply_pan_hz(pan);
+        dsp_set_zoom(s_zoom_factor, s_pan_offset_bins, ui_get_if_bin_shift(DSP_FFT_SIZE));
+        /* The push/land policy measures from where the view was left. A pan the
+         * operator placed by hand is a new starting point, not a push in
+         * progress, or the next tune pages immediately. */
+        s_sv_push = 0;
+        s_sv_side = 0;
+    }
+    update_bandplan_strip(s_last_qmx_freq_hz);
+    return s_last_qmx_freq_hz;
 }
 
 static void build_bandplan_strip(lv_obj_t *parent)
@@ -5376,9 +5626,9 @@ static void build_waterfall(lv_obj_t *parent)
     // bottom bar". 22 px is simply not a finger.
     //
     // So the strip's TOUCH area grows upward into the waterfall while its drawn
-    // height stays 22 px. Tap-to-tune gives up the same 50 px, which it can
-    // afford - the waterfall is 370 px tall and none of the interesting part of
-    // it is in the last centimetre.
+    // height stays 22 px. Tap-to-tune gives up the same BP_CATCH_PX, which it
+    // can afford - the waterfall is 370 px tall and none of the interesting
+    // part of it is in the last centimetre.
     //
     // Deliberately a separate transparent object rather than a taller
     // s_bandplan_obj: every segment, label, marker and knob inside that object
@@ -5542,7 +5792,20 @@ static void build_bottom_bar(lv_obj_t *parent)
     // every time that text is updated, so it stays glued just to the right
     // of "(X.XV)" instead of a fixed offset that drifts with text length.
     lv_obj_align_to(s_bot_diag_dot, s_bot_left, LV_ALIGN_OUT_RIGHT_MID, 30, 0);
-    lv_obj_add_flag(s_bot_diag_dot, LV_OBJ_FLAG_HIDDEN);  // shown only while a card is mounted
+    // ⛔ NO LONGER HIDDEN WHEN THERE IS NO CARD. It used to disappear, and an
+    // absent widget tells the operator nothing at all - it reads exactly like
+    // "I have not noticed it". Now it is always on the bar and says which of the
+    // four states it is in: green mirroring, yellow boot-backup-only, grey with
+    // a stroke through it for no card. Same reasoning, and the same mechanism,
+    // as ui_set_bottom_battery_absent().
+    // ⛔ NO CLICK HANDLER HERE, AND THAT IS NOT AN OVERSIGHT. `s_bottom_edge_strip`
+    // is a full-width clickable object over this whole zone, foregrounded on the
+    // SCREEN - and LVGL hit-tests a parent’s children in REVERSE CREATION ORDER,
+    // taking the first hit, without comparing areas. The strip is last in that
+    // list, so it swallows every press on the bar and an event callback on this
+    // dot can never fire. It was written that way first and was completely inert
+    // on the glass. The tap is arbitrated by x inside bottom_edge_swipe_cb()
+    // instead, the same way the update line already is - see sd_indicator_hit().
 
     // "SD" label next to the dot - same visibility lifecycle, re-anchored
     // off the dot itself in reposition_diag_dot() so it tracks along with it.
@@ -5551,7 +5814,18 @@ static void build_bottom_bar(lv_obj_t *parent)
     lv_obj_set_style_text_color(s_bot_diag_label, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
     lv_obj_set_style_text_font(s_bot_diag_label, &lv_font_montserrat_24, 0);
     lv_obj_align_to(s_bot_diag_label, s_bot_diag_dot, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
-    lv_obj_add_flag(s_bot_diag_label, LV_OBJ_FLAG_HIDDEN);
+
+    // The "no card" stroke, drawn across BOTH the dot and the label - a slash
+    // over a 14 px dot alone would not read at arm's length. Points persist for
+    // the line's lifetime, hence static, same as batt_slash_pts.
+    static lv_point_precise_t sd_slash_pts[2] = { {0, 28}, {52, 4} };
+    s_bot_sd_slash = lv_line_create(bar);
+    lv_line_set_points(s_bot_sd_slash, sd_slash_pts, 2);
+    lv_obj_set_style_line_color(s_bot_sd_slash, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+    lv_obj_set_style_line_width(s_bot_sd_slash, 3, 0);
+    lv_obj_set_style_line_rounded(s_bot_sd_slash, true, 0);
+    lv_obj_align_to(s_bot_sd_slash, s_bot_diag_dot, LV_ALIGN_LEFT_MID, -4, 0);
+    lv_obj_add_flag(s_bot_sd_slash, LV_OBJ_FLAG_HIDDEN);
 
     // Firmware version, centered between the battery text and the UTC clock.
     s_bot_version = lv_label_create(bar);
@@ -6682,6 +6956,7 @@ void ui_init(lv_display_t *disp)
     /* BLE keystrokes, applied on this thread - see ui_kbd_feed(). */
     s_kbd_q = xQueueCreate(32, sizeof(kbd_q_ev_t));
     lv_timer_create(kbd_q_drain_cb, 20, NULL);
+    lv_timer_create(bp_view_q_drain_cb, 20, NULL);   /* band-plan view move, off the httpd task */
 
     // "Waiting for QMX" prompt (see qmx_wait_poll_cb above). Full-screen,
     // transparent background so it reads over whatever's underneath on any
@@ -7479,6 +7754,12 @@ void ui_update_frequency(uint32_t freq_hz)
      * sitting there stays workable, then a page carrying some of the old screen
      * over. */
     if (!sv_effective() || prev_freq_hz == 0) {
+        /* Consume them here too, or a flag raised while the still display is
+         * off survives until it is switched back on and re-frames some later,
+         * unrelated tune. still_view_follow_dial() is the only other consumer
+         * and it never runs on this path. */
+        s_sv_jump_pending    = false;
+        s_sv_reframe_pending = false;
         s_pan_offset_bins = 0;
         s_sv_pan_hz = 0;
         recompute_zoom_pan();
@@ -7702,6 +7983,43 @@ static void topbar_reconcile_cb(lv_timer_t *t)
         // dial-push) - a band change from ANY source (tap, memory recall,
         // the radio's own knob) needs to restore whatever was last set for
         // the new band, same as wspr_dbm_area_refresh() does for WSPR.
+        output_power_area_refresh();
+    }
+
+    /* ⛔ RE-ASSERT OUTPUT POWER ON EVERY FRESH CAT LINK - THE BOOT PATH HAD NO
+     * TRANSITION TO HANG IT ON, which is the v1.12.1 top-bar bug again (see
+     * CLAUDE.md, "a per-mode UI state applied at the TRANSITION is not applied
+     * on the path that has no transition").
+     *
+     * Max. PA voltage lives in the RADIO and survives a Tab5 reboot untouched -
+     * a reflash does not reset it. WSPR's declared power legitimately drives it
+     * right down (measured: 2.3 V = 200 mW for 23 dBm on 20 m), and the ONLY
+     * place that ever handed it back was ui_set_base_mode()'s
+     * `cur == UI_MODE_WSPR` stand-down branch: a LIVE mode change away from the
+     * WSPR page. Boot has no such transition - ui_apply_saved_mode_view()/
+     * _start() restore the mode directly - so WSPR -> reboot -> FT8 came up
+     * transmitting at whatever WSPR last declared, with the drawer showing the
+     * Output power target the radio was NOT at. Operator, 2026-09-17: "I moved
+     * to ft8 and the output is now 200 mW and not 3.6 W as the drawer
+     * indicate". Confirmed on the bench: the radio answered MM2.30; while the
+     * drawer read 3.6 W, and that whole boot's log had no `PA voltage ->` line.
+     *
+     * ⚠ NOT hung off ui_apply_saved_mode_start() even though that is where the
+     * gap is: it runs from app_main at a few seconds of uptime and CAT does not
+     * open until ~17 s, so it would read no frequency, find no band, and skip
+     * the write on every boot - silently. That is CLAUDE.md's own CW-pitch trap
+     * ("that write went nowhere on EVERY boot - measured, with timestamps").
+     * Keying it to the link going ready instead cannot race it, and re-arming
+     * on every drop also covers a QMX power-cycled mid-session, which comes
+     * back with its own stored configuration.
+     *
+     * Change-detected, so this is one CAT write per link-up, not a 1 Hz poll -
+     * MM writes are expensive and want spacing (see cat.c's MM notes). */
+    static bool s_outpwr_seeded_for_link = false;
+    if (!cat_is_ready()) {
+        s_outpwr_seeded_for_link = false;
+    } else if (!s_outpwr_seeded_for_link) {
+        s_outpwr_seeded_for_link = true;
         output_power_area_refresh();
     }
 
@@ -9024,6 +9342,10 @@ static void reposition_diag_dot(void)
     if (s_bot_diag_label && s_bot_diag_dot) {
         lv_obj_align_to(s_bot_diag_label, s_bot_diag_dot, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
     }
+    // The slash spans the dot AND the label, so it has to travel with them.
+    if (s_bot_sd_slash && s_bot_diag_dot) {
+        lv_obj_align_to(s_bot_sd_slash, s_bot_diag_dot, LV_ALIGN_LEFT_MID, -4, 0);
+    }
 }
 
 void ui_set_bottom_left(const char *text)
@@ -9226,6 +9548,27 @@ static bool update_line_hit(int x)
     lv_obj_get_coords(s_bot_version, &a);
     const int margin = 20;                 // finger-sized, still well clear of SD/clock
     return x >= (int)a.x1 - margin && x <= (int)a.x2 + margin;
+}
+
+// True when x falls on the microSD indicator (the dot AND the "SD" label).
+//
+// The dot is 14 px, so the span is taken from the dot’s left edge to the
+// label’s right edge plus a finger margin, rather than from either object
+// alone. Same arbitration-by-x as update_line_hit(), for the same reason: the
+// bottom edge strip owns every press down here, so a target on the bar has to
+// be recognised inside bottom_edge_swipe_cb() or it does not exist.
+static bool sd_indicator_hit(int x)
+{
+    if (!s_bot_diag_dot) return false;
+    lv_area_t d, l;
+    lv_obj_get_coords(s_bot_diag_dot, &d);
+    int x1 = (int)d.x1, x2 = (int)d.x2;
+    if (s_bot_diag_label) {
+        lv_obj_get_coords(s_bot_diag_label, &l);
+        if ((int)l.x2 > x2) x2 = (int)l.x2;
+    }
+    const int margin = 18;
+    return x >= x1 - margin && x <= x2 + margin;
 }
 
 void ui_set_update_line(const char *text, uint32_t colour)
@@ -9477,6 +9820,9 @@ static void touch_event_cb(lv_event_t *e)
         s_bp_drag_start_pt = p;
         s_bp_drag_start_freq = (int64_t)s_last_qmx_freq_hz;
         s_bp_drag_target_hz = s_bp_drag_start_freq;
+        s_bp_preview_pan_hz     = ui_get_pan_offset_hz();
+        s_bp_drag_start_view_hz = (int64_t)s_last_qmx_freq_hz + s_bp_preview_pan_hz;
+        s_bp_drag_view_hz       = s_bp_drag_start_view_hz;
 
         qmx_settings_t s;
         settings_load_all(&s);
@@ -9568,21 +9914,29 @@ static void touch_event_cb(lv_event_t *e)
                 }
             }
             double hz_per_px = (double)(s_bp_drag_band_hi - s_bp_drag_band_lo) / (double)DISPLAY_H_RES;
-            int64_t target = s_bp_drag_start_freq + (int64_t)lround((double)dx * hz_per_px);
-            target = ((target + 500) / 1000) * 1000;   // snap centre to whole kHz (xx.xxx.000 Hz)
-            if (target < (int64_t)s_bp_drag_band_lo) target = (int64_t)s_bp_drag_band_lo;
-            if (target > (int64_t)s_bp_drag_band_hi) target = (int64_t)s_bp_drag_band_hi;
-            s_bp_drag_target_hz = target;
+            /* What moves is the WINDOW CENTRE - see bp_solve_view(). The dial
+             * comes with it only when the radio cannot reach that far. */
+            int64_t cwant = s_bp_drag_start_view_hz + (int64_t)lround((double)dx * hz_per_px);
+            if (cwant < (int64_t)s_bp_drag_band_lo) cwant = (int64_t)s_bp_drag_band_lo;
+            if (cwant > (int64_t)s_bp_drag_band_hi) cwant = (int64_t)s_bp_drag_band_hi;
+            s_bp_drag_view_hz = cwant;
 
-            update_bandplan_strip((uint32_t)target);
+            uint32_t dial_pred = s_last_qmx_freq_hz;
+            int64_t  pan_pred  = ui_get_pan_offset_hz();
+            bp_solve_view(cwant, &dial_pred, &pan_pred);
+            s_bp_drag_target_hz = (int64_t)dial_pred;
+            s_bp_preview_pan_hz = pan_pred;
+
+            update_bandplan_strip(dial_pred);
             // Live top-bar "Freq: ..." text during the drag - display only,
             // no CAT write (deferred to release, same reasoning as the
             // spectrum's own pan gesture: a fast drag must not flood the
-            // QMX with frequency writes).
+            // QMX with frequency writes). Usually it does not change at all:
+            // a drag inside the radio's reach moves the window and leaves the
+            // dial alone, which is the whole point of the gesture.
             if (s_freq_label) {
                 char fb[32];
-                uint32_t t = (uint32_t)target;
-                { char fs[16]; format_freq_hz(t, g_freq_style, fs, sizeof(fs));
+                { char fs[16]; format_freq_hz(dial_pred, g_freq_style, fs, sizeof(fs));
                   snprintf(fb, sizeof(fb), "Freq: %s Hz", fs); }
                 lv_label_set_text(s_freq_label, fb);
             }
@@ -9596,6 +9950,7 @@ static void touch_event_cb(lv_event_t *e)
             if (was_dragging) {
                 uint32_t tgt = (uint32_t)s_bp_drag_target_hz;
                 cat_set_frequency_forced(tgt);
+                ui_note_view_reframe();   /* the window was dragged - it moves */
                 ui_update_frequency(tgt);
             }
             s_touch_on_bandplan = false;
@@ -9626,9 +9981,8 @@ static void touch_event_cb(lv_event_t *e)
         if (code == LV_EVENT_RELEASED) {
             bool was_dragging = s_bp_dragging;
             if (s_bp_dragging && s_bp_drag_band_hi > s_bp_drag_band_lo) {
-                uint32_t tgt = (uint32_t)s_bp_drag_target_hz;
-                cat_set_frequency_forced(tgt);  // deliberate user action — bypass the 200ms rate-limiter so it always lands
-                ui_update_frequency(tgt);
+                s_bp_dragging = false;   /* so the strip draws from the REAL pan now */
+                ui_bandplan_move_view(s_bp_drag_view_hz);
             }
             // A plain tap (never exceeded the drag threshold): jump straight
             // to the tapped position in the band, same "tap anywhere to go
@@ -9645,6 +9999,7 @@ static void touch_event_cb(lv_event_t *e)
                 if (tap_hz < (int64_t)s_bp_drag_band_lo) tap_hz = (int64_t)s_bp_drag_band_lo;
                 if (tap_hz > (int64_t)s_bp_drag_band_hi) tap_hz = (int64_t)s_bp_drag_band_hi;
                 cat_set_frequency_forced((uint32_t)tap_hz);
+                ui_note_view_reframe();   /* a place in the band was pointed at */
                 ui_update_frequency((uint32_t)tap_hz);
             }
             s_touch_on_bandplan = false;
@@ -10040,7 +10395,23 @@ static void bottom_edge_swipe_cb(lv_event_t *e)
              * page has its own band control for the only move that makes sense
              * here. */
             ui_show_memories();
-        } else if (be_decided == 0 && s_update_press_ms && s_update_tap_cb) {
+        } else if (be_decided == 0 && be_start_x >= 0 && sd_indicator_hit(be_start_x)) {
+            // The microSD indicator. Tappable in every state, including the
+            // crossed-out one - "what is on my card" is a fair question with a
+            // card in, and "what would one give me" is the better question
+            // without. Both are answered by the same manual section, so this is
+            // one target with one behaviour rather than two.
+            //
+            // ⭐ IT OPENS THE MANUAL, NOT A MODAL OF ITS OWN. The benefit list
+            // already exists in docs/mkdocs/guide/settings.md, the single source
+            // for the website, the PDF and the embedded manual; a modal would be
+            // a FOURTH copy of it, which is the rot CLAUDE.md records under
+            // "the docs live in TWO trees". Going through help_open() also means
+            // pack_manual.py fails the build if that heading is ever renamed.
+            ESP_LOGI("ui", "SD indicator tapped (x=%d)", (int)be_start_x);
+            help_open(HELP_SD_BENEFITS);
+        } else if (be_decided == 0 && s_update_press_ms && s_update_tap_cb &&
+                   update_line_hit(s_update_press_x)) {
             // #239: a SHORT TAP now acts, and that is the whole point of the
             // rework. It opens ota_modal and does nothing else - no download,
             // no reboot - so the thing the 700 ms hold was protecting against
@@ -10695,10 +11066,71 @@ static void drawer_btn_wspr_hop_cb(lv_event_t *e)
     wspr_screen_view_open_hop_picker();
 }
 
-static void drawer_dropdown_wspr_duty_cb(lv_event_t *e)
+/* The schedule is two counts and one sentence. The sentence is regenerated
+ * from the counts every time either changes, so it can never describe a
+ * schedule that is not the one running - which is the whole reason "1 in N"
+ * plus "bursts per transmission" was replaced (see settings.h). */
+static lv_obj_t *s_wspr_sched_desc = NULL;
+static lv_obj_t *s_wspr_rx_dd     = NULL;   /* greyed out while "Receive only" */
+static lv_obj_t *s_wspr_rx_hdr    = NULL;
+
+static void wspr_sched_desc_refresh(void)
+{
+    if (!s_wspr_sched_desc) return;
+    uint8_t tx = settings_get_wspr_tx_cycles();
+    uint8_t rx = settings_get_wspr_rx_cycles();
+    char buf[128];
+    /* ⛔ GREYED MEANS INERT, and that is not decoration here. "Receive only"
+     * leaves the receive count with nothing to describe - there is no group -
+     * so it is DISABLED as well as dimmed. This project has already shipped a
+     * control that looked dead and still took input (the top-bar frequency
+     * label, v1.12.1); the operator called that a broken promise and he was
+     * right. Both states are set from this one function so they cannot drift. */
+    if (s_wspr_rx_dd) {
+        if (tx == 0) {
+            lv_obj_add_state(s_wspr_rx_dd, LV_STATE_DISABLED);
+            lv_obj_clear_flag(s_wspr_rx_dd, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_opa(s_wspr_rx_dd, LV_OPA_40, 0);
+            if (s_wspr_rx_hdr) lv_obj_set_style_opa(s_wspr_rx_hdr, LV_OPA_40, 0);
+        } else {
+            lv_obj_remove_state(s_wspr_rx_dd, LV_STATE_DISABLED);
+            lv_obj_add_flag(s_wspr_rx_dd, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_opa(s_wspr_rx_dd, LV_OPA_COVER, 0);
+            if (s_wspr_rx_hdr) lv_obj_set_style_opa(s_wspr_rx_hdr, LV_OPA_COVER, 0);
+        }
+    }
+    if (tx == 0) {
+        snprintf(buf, sizeof(buf), "Receive only - never transmits.");
+    } else {
+        unsigned period = (unsigned)(tx + rx);
+        snprintf(buf, sizeof(buf),
+                 "Transmit %u, then listen %u - repeating every %u min.\n"
+                 "Transmitting %u%% of the time.",
+                 (unsigned)tx, (unsigned)rx, period * 2u,
+                 (unsigned)((tx * 100u) / period));
+    }
+    lv_label_set_text(s_wspr_sched_desc, buf);
+}
+
+static void drawer_dropdown_wspr_tx_cycles_cb(lv_event_t *e)
 {
     uint16_t i = lv_dropdown_get_selected(lv_event_get_target(e));
-    if (i < WSPR_N_DUTY) settings_set_wspr_duty_pct(kDuty[i]);
+    settings_set_wspr_tx_cycles((uint8_t)i);   /* index 0 == receive only */
+    wspr_sched_desc_refresh();
+    wspr_rx_tx_schedule_reset(settings_get_wspr_tx_en(),
+                              settings_get_wspr_tx_cycles(),
+                              settings_get_wspr_rx_cycles());
+}
+
+static void drawer_dropdown_wspr_rx_cycles_cb(lv_event_t *e)
+{
+    if (settings_get_wspr_tx_cycles() == 0) return;   /* greyed = inert, belt and braces */
+    uint16_t i = lv_dropdown_get_selected(lv_event_get_target(e));
+    settings_set_wspr_rx_cycles((uint8_t)(i + 1));   /* index 0 == 1 receive cycle */
+    wspr_sched_desc_refresh();
+    wspr_rx_tx_schedule_reset(settings_get_wspr_tx_en(),
+                              settings_get_wspr_tx_cycles(),
+                              settings_get_wspr_rx_cycles());
 }
 
 /* Declared power. This is PUBLISHED WORLDWIDE with every spot and is what other
@@ -10878,8 +11310,16 @@ static void wspr_dbm_area_refresh(void)
     char dbm_opts[WSPR_STD_DBM_N * 24];
     int n_ach = build_wspr_dbm_options(band, dbm_opts, sizeof(dbm_opts));
 
-    qmx_settings_t ws;
-    settings_load_all(&ws);
+    /* ⛔ WAS A WHOLE qmx_settings_t ON THE STACK FOR ONE int8_t FIELD, and it
+     * crashed the device: `/api/cmd {"action":"drawer"}` opens the drawer from
+     * the HTTPD WORKER TASK (10 KB stack, vs taskLVGL's 12 KB), so this whole
+     * refresh chain ran there - Stack protection fault, task httpd, 2026-09-17,
+     * landing inside vsnprintf() because that is simply what tipped an already
+     * exhausted stack over. Third instance of this exact bug class in one
+     * night; see settings_get_sim_mode_en()'s comment for the other two.
+     * Narrow read instead - the struct was only ever consulted for
+     * wspr_tx_dbm. */
+    struct { int8_t wspr_tx_dbm; } ws = { settings_get_wspr_tx_dbm() };
 
     if (n_ach == 0) {
         /* Not calibrated (or no swept point classifies as ANY standard
@@ -11358,7 +11798,6 @@ static void drawer_refresh_checkboxes(void)
     sync_cb(s_check_cw_decode,      c.cw_decode_en);
     sync_cb(s_check_wspr_net,       c.wspr_net_en);
     sync_cb(s_check_charge_limit,   c.charge_limit_en);
-    sync_cb(s_switch_otadl,         c.ota_autodl);
     sync_cb(s_cb_bt,                c.bt_mouse_en);
     sync_cb(s_check_rit_pill,       c.rit_pill_show);
     /* These three are owned by a module rather than read straight from the
@@ -12195,22 +12634,17 @@ static void drawer_build(void)
     // the 3.3 MB is fetched, not about whether an update can happen behind
     // anyone's back.
     {
-        lv_obj_t *sec = drawer_section(DRAWER_SEC_OTADL, y, 88);
-        lv_obj_t *l1 = lv_label_create(sec);
-        lv_label_set_text(l1, "Download updates");
-        lv_obj_set_style_text_color(l1, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_text_font(l1, &lv_font_montserrat_28, 0);
-        lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 0, 6);
-        lv_obj_t *l2 = lv_label_create(sec);
-        lv_label_set_text(l2, "in the background, ready to install");
-        lv_obj_set_style_text_color(l2, lv_color_hex(UI_COLOR_TEXT_MUTED), 0);
-        lv_obj_set_style_text_font(l2, &lv_font_montserrat_20, 0);
-        lv_obj_align(l2, LV_ALIGN_TOP_LEFT, 0, 44);
-        qmx_settings_t oc;
-        settings_load_all(&oc);
-        s_switch_otadl = make_drawer_checkbox(sec, oc.ota_autodl, drawer_otadl_cb, NULL);
-        lv_obj_align(s_switch_otadl, LV_ALIGN_TOP_RIGHT, 0, 6);
-        y += 88;
+        /* ⛔ THE "Download updates in the background" CHECKBOX IS GONE
+         * (2026-09-17). The feature behind it is gone too - see the tombstone
+         * in update_check.c. It had been suppressed by a 32 KB free-heap guard
+         * for months without anyone noticing, so this control had been
+         * promising something that never happened, and the operator had long
+         * since concluded it was obsolete. He was right.
+         *
+         * DRAWER_SEC_OTADL is left defined so a stored Basic/Advanced layout
+         * that mentions it stays readable - see the third mask in #268/#272,
+         * which exists precisely so an absent section is not confused with an
+         * unticked one. */
     }
 
     /* #298 STILL SPECTRUM. Two sentences of explanation under the switch,
@@ -12257,53 +12691,64 @@ static void drawer_build(void)
         qmx_settings_t scfg_spots;
         settings_load_all(&scfg_spots);
         lv_obj_t *sec = drawer_section(DRAWER_SEC_SPOTS, y, 278);   /* four source rows + the mode-filter row */
+        // Reordered and renamed (operator, 2026-09-16): "POTA spots / SOTA
+        // spots / CW spots / Phone spots", each row's text coloured to match
+        // what that source actually draws on the spectrum
+        // (SPOTS_COL_POTA/SPOTS_COL_RBN, spots_lane.h) - the checkbox text
+        // was plain white before, so there was nothing here to connect a row
+        // to the colour it turns on. POTA/SOTA/Phone all read the same
+        // amber: that is not a labelling shortcut, it is what spots_lane.c
+        // actually paints for all three today (see that file's own colour
+        // table comment) - only CW (RBN) has a distinct hue.
         lv_obj_t *hdr = lv_label_create(sec);
-        lv_label_set_text(hdr, "Live spots (POTA)");
-        lv_obj_set_style_text_color(hdr, lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_text(hdr, "POTA spots");
+        lv_obj_set_style_text_color(hdr, lv_color_hex(SPOTS_COL_POTA), 0);
         lv_obj_set_style_text_font(hdr, &lv_font_montserrat_28, 0);
         lv_obj_align(hdr, LV_ALIGN_TOP_LEFT, 0, 10);
         s_check_spots = make_drawer_checkbox(sec, scfg_spots.spots_en, drawer_spots_cb, NULL);
         lv_obj_align(s_check_spots, LV_ALIGN_TOP_RIGHT, 0, 6);
 
-        lv_obj_t *rbn_lbl = lv_label_create(sec);
-        // Same weight and indent as the POTA row: RBN is a second SOURCE, not a
-        // sub-option of the first (operator, 2026-08-09).
-        lv_label_set_text(rbn_lbl, "RBN spots (CW skimmers)");
-        lv_obj_set_style_text_color(rbn_lbl, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_text_font(rbn_lbl, &lv_font_montserrat_28, 0);
-        lv_obj_align(rbn_lbl, LV_ALIGN_TOP_LEFT, 0, 62);
-        s_check_rbn = make_drawer_checkbox(sec, scfg_spots.rbn_en, drawer_rbn_cb, NULL);
-        lv_obj_align(s_check_rbn, LV_ALIGN_TOP_RIGHT, 0, 62);
-
-        // DX cluster: the third source, and the only one carrying PHONE spots -
-        // RBN is skimmers and no SSB skimmer exists. Same weight and indent as
-        // the other two: it is a SOURCE, not a sub-option of either.
-        lv_obj_t *dxc_lbl = lv_label_create(sec);
-        lv_label_set_text(dxc_lbl, "DX cluster spots (phone)");
-        lv_obj_set_style_text_color(dxc_lbl, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_text_font(dxc_lbl, &lv_font_montserrat_28, 0);
-        lv_obj_align(dxc_lbl, LV_ALIGN_TOP_LEFT, 0, 114);
-        s_check_cluster = make_drawer_checkbox(sec, scfg_spots.cluster_en, drawer_cluster_cb, NULL);
-        lv_obj_align(s_check_cluster, LV_ALIGN_TOP_RIGHT, 0, 114);
-
-        // SOTA: the fourth source, summit activations by way of spothole.app.
-        // Same weight and indent as the other three - a SOURCE, not a
-        // sub-option. Off by default, and the only source whose default is about
-        // courtesy to the server rather than to this board (see settings.h).
+        // SOTA: summit activations by way of spothole.app. Same weight and
+        // indent as the others - a SOURCE, not a sub-option. Off by default,
+        // and the only source whose default is about courtesy to the server
+        // rather than to this board (see settings.h).
         lv_obj_t *sota_lbl = lv_label_create(sec);
-        lv_label_set_text(sota_lbl, "SOTA spots (summits)");
-        lv_obj_set_style_text_color(sota_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_text(sota_lbl, "SOTA spots");
+        lv_obj_set_style_text_color(sota_lbl, lv_color_hex(SPOTS_COL_POTA), 0);
         lv_obj_set_style_text_font(sota_lbl, &lv_font_montserrat_28, 0);
-        lv_obj_align(sota_lbl, LV_ALIGN_TOP_LEFT, 0, 166);
+        lv_obj_align(sota_lbl, LV_ALIGN_TOP_LEFT, 0, 62);
         s_check_sota = make_drawer_checkbox(sec, scfg_spots.sota_en, drawer_sota_cb, NULL);
-        lv_obj_align(s_check_sota, LV_ALIGN_TOP_RIGHT, 0, 166);
+        lv_obj_align(s_check_sota, LV_ALIGN_TOP_RIGHT, 0, 62);
+
+        // RBN: CW skimmers, the only source with its own colour (green) -
+        // see spots_lane.c. Same weight and indent as the others: a SOURCE,
+        // not a sub-option of any of them (operator, 2026-08-09).
+        lv_obj_t *rbn_lbl = lv_label_create(sec);
+        lv_label_set_text(rbn_lbl, "CW spots");
+        lv_obj_set_style_text_color(rbn_lbl, lv_color_hex(SPOTS_COL_RBN), 0);
+        lv_obj_set_style_text_font(rbn_lbl, &lv_font_montserrat_28, 0);
+        lv_obj_align(rbn_lbl, LV_ALIGN_TOP_LEFT, 0, 114);
+        s_check_rbn = make_drawer_checkbox(sec, scfg_spots.rbn_en, drawer_rbn_cb, NULL);
+        lv_obj_align(s_check_rbn, LV_ALIGN_TOP_RIGHT, 0, 114);
+
+        // DX cluster: the only source carrying PHONE spots - RBN is skimmers
+        // and no SSB skimmer exists. Same weight and indent as the others: a
+        // SOURCE, not a sub-option of either.
+        lv_obj_t *dxc_lbl = lv_label_create(sec);
+        lv_label_set_text(dxc_lbl, "Phone spots");
+        lv_obj_set_style_text_color(dxc_lbl, lv_color_hex(SPOTS_COL_POTA), 0);
+        lv_obj_set_style_text_font(dxc_lbl, &lv_font_montserrat_28, 0);
+        lv_obj_align(dxc_lbl, LV_ALIGN_TOP_LEFT, 0, 166);
+        s_check_cluster = make_drawer_checkbox(sec, scfg_spots.cluster_en, drawer_cluster_cb, NULL);
+        lv_obj_align(s_check_cluster, LV_ALIGN_TOP_RIGHT, 0, 166);
 
         // Not a source - a filter over all four, so it sits below them with a
         // blank line between. Tapping a spot sets the MODE as well as the
         // frequency, so with this off a CW operator can land in FT8 without
-        // meaning to (Michael KZ4LY).
+        // meaning to (Michael KZ4LY). Plain white: it isn't a source, so it
+        // gets no source colour.
         lv_obj_t *smf_lbl = lv_label_create(sec);
-        lv_label_set_text(smf_lbl, "Mode filter the spots");
+        lv_label_set_text(smf_lbl, "Mode-filter the spots");
         lv_obj_set_style_text_color(smf_lbl, lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_style_text_font(smf_lbl, &lv_font_montserrat_28, 0);
         lv_obj_align(smf_lbl, LV_ALIGN_TOP_LEFT, 0, 228);
@@ -12792,7 +13237,7 @@ static void drawer_build(void)
         // 404 -> 300 with the spur row parked. The section HEIGHT and the
         // "y +=" below must always move together, or the next section
         // overlaps this one - the reflow trap this file records.
-        lv_obj_t *sec = drawer_section(DRAWER_SEC_WATERFALL, y, 300);
+        lv_obj_t *sec = drawer_section(DRAWER_SEC_WATERFALL, y, 396);
         lv_obj_t *wf_hdr = lv_label_create(sec);
         lv_label_set_text(wf_hdr, "Waterfall");
         lv_obj_set_style_text_color(wf_hdr, lv_color_hex(0xA0E0A0), 0);
@@ -12862,6 +13307,31 @@ static void drawer_build(void)
         lv_obj_add_event_cb(s_dropdown_wf_window, drawer_dropdown_wf_window_cb, LV_EVENT_VALUE_CHANGED, NULL);
         lv_obj_add_event_cb(s_dropdown_wf_window, drawer_dropdown_cmap_open_cb, LV_EVENT_CLICKED, NULL);
 
+        // Waterfall scroll speed (operator, 2026-09-16: "is wf speed always
+        // the same or where do i set it?" - it was, RENDER_PERIOD_MS is a
+        // compile-time #define). render_set_waterfall_speed_mult() already
+        // existed as the removed FT8-sync-lines diagnostic's private 1x/3x
+        // switch (render.c) - generalised into 1x..4x and given a real
+        // setting instead of building a second mechanism.
+        lv_obj_t *speed_lbl = lv_label_create(sec);
+        lv_label_set_text(speed_lbl, "Speed");
+        lv_obj_set_style_text_color(speed_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(speed_lbl, &lv_font_montserrat_28, 0);
+        lv_obj_align(speed_lbl, LV_ALIGN_TOP_LEFT, 0, 280);
+        s_dropdown_wf_speed = lv_dropdown_create(sec);
+        lv_dropdown_set_options(s_dropdown_wf_speed,
+                                "1x (10 rows/s)\n2x (20 rows/s)\n3x (30 rows/s)\n4x (40 rows/s)");
+        lv_obj_set_size(s_dropdown_wf_speed, DRAWER_W - 32, 50);
+        lv_obj_align(s_dropdown_wf_speed, LV_ALIGN_TOP_LEFT, 0, 316);
+        lv_obj_set_style_text_font(s_dropdown_wf_speed, &lv_font_montserrat_28, 0);
+        {
+            uint8_t mult = wcfg.wf_speed_mult;
+            if (mult < 1 || mult > 4) mult = 1;
+            lv_dropdown_set_selected(s_dropdown_wf_speed, mult - 1);
+        }
+        lv_obj_add_event_cb(s_dropdown_wf_speed, drawer_dropdown_wf_speed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(s_dropdown_wf_speed, drawer_dropdown_cmap_open_cb, LV_EVENT_CLICKED, NULL);
+
         // ⛔ SPUR SUPPRESSION IS PARKED - the control is deliberately NOT built.
         //
         // It only ever reached the display at zoom x1. Above that both the
@@ -12892,7 +13362,7 @@ static void drawer_build(void)
         // references there. Then measure it WITH AN ANTENNA, not on an open
         // BNC. See TODO #222.
 
-        y += 300;
+        y += 396;
     }
 
     // FT8-only sections built LAST so they never leave a gap in Panadapter
@@ -13182,36 +13652,80 @@ static void drawer_build(void)
     {
         qmx_settings_t ws;
         settings_load_all(&ws);
-        lv_obj_t *sec = drawer_section(DRAWER_SEC_WSPRDUTY, y, 100);
+        /* 200, not 100: the bursts-per-transmission dropdown below adds a
+         * second header+dropdown pair. SECTION HEIGHT AND THE y += AT THE END
+         * OF THIS BLOCK MUST MOVE TOGETHER - this file records a release where
+         * they did not and the next section drew on top of this one. */
+        /* 260, not 200: two dropdowns plus the two-line description that
+         * spells the schedule out. SECTION HEIGHT AND THE y += AT THE END OF
+         * THIS BLOCK MUST MOVE TOGETHER - this file records a release where
+         * they did not and the next section drew on top of this one. */
+        lv_obj_t *sec = drawer_section(DRAWER_SEC_WSPRDUTY, y, 260);
         lv_obj_t *hdr = lv_label_create(sec);
-        lv_label_set_text(hdr, "WSPR duty cycle");
+        lv_label_set_text(hdr, "WSPR transmit schedule");
         lv_obj_set_style_text_color(hdr, lv_color_hex(0xA0E0A0), 0);
         lv_obj_set_style_text_font(hdr, &lv_font_montserrat_28, 0);
         lv_obj_align(hdr, LV_ALIGN_TOP_LEFT, 0, 0);
-        lv_obj_t *dd = lv_dropdown_create(sec);
-        /* "1 in N", not a percentage, and not "about" - it is now an exact
-         * period. See kDuty[]/roll_next_tx_cycle() in wspr_rx.c. */
-        lv_dropdown_set_options(dd,
-            "Receive only\n1 in 2\n1 in 3\n1 in 4\n1 in 5\n1 in 10");
-        lv_obj_set_size(dd, DRAWER_W - 32, 50);
-        lv_obj_align(dd, LV_ALIGN_TOP_LEFT, 0, 40);
-        lv_obj_set_style_text_font(dd, &lv_font_montserrat_28, 0);
+
+        /* ⛔ TWO COUNTS, NOT A RATIO. "1 in 5" plainly means one cycle in
+         * five and the code did exactly that for a single burst - but it says
+         * nothing about what a SECOND burst does to the period, and the
+         * operator and I each read it the other way round in the same
+         * afternoon. Two counts cannot be read two ways. See settings.h. */
+        lv_obj_t *thdr = lv_label_create(sec);
+        lv_label_set_text(thdr, "Transmit cycles");
+        lv_obj_set_style_text_color(thdr, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+        lv_obj_set_style_text_font(thdr, &lv_font_montserrat_28, 0);
+        lv_obj_align(thdr, LV_ALIGN_TOP_LEFT, 0, 40);
+        lv_obj_t *tdd = lv_dropdown_create(sec);
+        lv_dropdown_set_options(tdd, "Receive only\n1\n2\n3\n4");
+        lv_obj_set_size(tdd, (DRAWER_W - 48) / 2, 50);
+        lv_obj_align(tdd, LV_ALIGN_TOP_LEFT, 0, 78);
+        lv_obj_set_style_text_font(tdd, &lv_font_montserrat_28, 0);
         {
-            /* Fallback index 4 = kDuty[4] = 5 ("1 in 5"), matching settings.c's
-             * own default - was index 2 against the old 5-entry array, which
-             * would now silently mean "1 in 3" if nothing matched. */
-            uint16_t idx = 4;
-            for (int k = 0; k < WSPR_N_DUTY; k++)
-                if (kDuty[k] == ws.wspr_duty_pct) { idx = (uint16_t)k; break; }
-            lv_dropdown_set_selected(dd, idx);
+            uint8_t t = ws.wspr_tx_cycles;
+            if (t > 4) t = 1;
+            lv_dropdown_set_selected(tdd, (uint16_t)t);
         }
-        lv_obj_add_event_cb(dd, drawer_dropdown_wspr_duty_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(tdd, drawer_dropdown_wspr_tx_cycles_cb, LV_EVENT_VALUE_CHANGED, NULL);
         /* The OPTION LIST is a separate object with its own font - without
          * this it opens at LVGL's default, which is much smaller than
-         * everything around it. Every other dropdown in this drawer
-         * already does this; these two were added without it. */
-        lv_obj_add_event_cb(dd, drawer_dropdown_cmap_open_cb, LV_EVENT_CLICKED, NULL);
-        y += 100;
+         * everything around it. */
+        lv_obj_add_event_cb(tdd, drawer_dropdown_cmap_open_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *rhdr = lv_label_create(sec);
+        lv_label_set_text(rhdr, "Receive cycles");
+        lv_obj_set_style_text_color(rhdr, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+        lv_obj_set_style_text_font(rhdr, &lv_font_montserrat_28, 0);
+        lv_obj_align(rhdr, LV_ALIGN_TOP_LEFT, (DRAWER_W - 48) / 2 + 16, 40);
+        s_wspr_rx_hdr = rhdr;
+        lv_obj_t *rdd = lv_dropdown_create(sec);
+        /* 1-20. Never 0 - that keys the radio continuously (settings.h). */
+        lv_dropdown_set_options(rdd,
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20");
+        lv_obj_set_size(rdd, (DRAWER_W - 48) / 2, 50);
+        lv_obj_align(rdd, LV_ALIGN_TOP_LEFT, (DRAWER_W - 48) / 2 + 16, 78);
+        lv_obj_set_style_text_font(rdd, &lv_font_montserrat_28, 0);
+        {
+            uint8_t r = ws.wspr_rx_cycles;
+            if (r < 1 || r > 20) r = 4;
+            lv_dropdown_set_selected(rdd, (uint16_t)(r - 1));
+        }
+        lv_obj_add_event_cb(rdd, drawer_dropdown_wspr_rx_cycles_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(rdd, drawer_dropdown_cmap_open_cb, LV_EVENT_CLICKED, NULL);
+        s_wspr_rx_dd = rdd;
+
+        /* The schedule in words, regenerated from the counts - see
+         * wspr_sched_desc_refresh(). */
+        s_wspr_sched_desc = lv_label_create(sec);
+        lv_obj_set_style_text_color(s_wspr_sched_desc, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+        lv_obj_set_style_text_font(s_wspr_sched_desc, &lv_font_montserrat_24, 0);
+        lv_obj_set_width(s_wspr_sched_desc, DRAWER_W - 32);
+        lv_label_set_long_mode(s_wspr_sched_desc, LV_LABEL_LONG_WRAP);
+        lv_obj_align(s_wspr_sched_desc, LV_ALIGN_TOP_LEFT, 0, 140);
+        wspr_sched_desc_refresh();
+        /* Matches drawer_section(..., 260) above - see the note there. */
+        y += 260;
     }
     {
         qmx_settings_t ws;
@@ -13277,6 +13791,7 @@ static void drawer_build(void)
     //    dark drawer), applied to the closed box AND the option list
     lv_obj_t *drawer_dropdowns[] = {
         s_dropdown_sleep, s_dropdown_bpregion, s_dropdown_cmap, s_dropdown_wf_window,
+        s_dropdown_wf_speed,
     };
     for (size_t i = 0; i < sizeof(drawer_dropdowns) / sizeof(drawer_dropdowns[0]); i++) {
         lv_obj_t *dd = drawer_dropdowns[i];
@@ -14144,13 +14659,6 @@ static void drawer_expert_paint(void)
 // Background download on/off. Nothing else changes: the update check still
 // runs, the bar still says when a new version exists, and installing one is
 // still a deliberate press.
-static void drawer_otadl_cb(lv_event_t *e)
-{
-    lv_obj_t *cb = lv_event_get_target(e);
-    bool on = lv_obj_has_state(cb, LV_STATE_CHECKED);
-    settings_set_ota_autodl(on);
-    ESP_LOGI(TAG, "background download of updates: %s", on ? "ON" : "OFF");
-}
 
 // Flip the view and re-lay the drawer out for whichever screen is showing.
 static void drawer_expert_btn_cb(lv_event_t *e)
@@ -14534,6 +15042,14 @@ static void drawer_dropdown_wf_window_cb(lv_event_t *e)
     uint8_t idx = (uint8_t)lv_dropdown_get_selected(lv_event_get_target(e));
     dsp_set_window(idx);
     settings_set_wf_window(idx);
+}
+
+static void drawer_dropdown_wf_speed_cb(lv_event_t *e)
+{
+    uint8_t idx = (uint8_t)lv_dropdown_get_selected(lv_event_get_target(e));
+    uint8_t mult = idx + 1;   // dropdown is 0-based ("1x"=idx 0), the setting is the multiplier itself
+    render_set_waterfall_speed_mult(mult);
+    settings_set_wf_speed_mult(mult);
 }
 
 // Spur suppression. Live DSP path AND stored value, like the IQ balance switch -
@@ -15141,7 +15657,26 @@ static void kbd_text_cb(const char *text, uint8_t mods, void *arg);
  *
  * A BLE MOUSE does not count: bt_hid_keyboard_active() requires the device's own
  * report map to declare a keyboard. And it goes false on disconnect, so a
- * keyboard that runs flat or walks out of range brings this straight back. */
+ * keyboard that runs flat or walks out of range brings this straight back.
+ *
+ * ⛔ EVERY CALLER MUST BE WIRED TO LV_EVENT_CLICKED AS WELL AS LV_EVENT_FOCUSED,
+ * AND THAT IS NOT BELT-AND-BRACES - IT IS THE ONLY ONE THAT ALWAYS FIRES.
+ * LVGL sends FOCUSED when an object GAINS focus. Tap a field, type, tap
+ * somewhere else, then tap the same field again: if LVGL still considers it the
+ * focused object, the second tap sends NO FOCUSED event, so nothing re-shows the
+ * keyboard and the field cannot be typed into again. The dialog is left looking
+ * alive with no way to finish the entry.
+ *
+ * Samuel W7STF, 2026-09-18, on the WiFi and Callsign/QTH dialogs: "the keyboard
+ * disappears, but input dialog remains. you cannot press the input field again
+ * to call up the keyboard and finish the entry." All SIX modals and all NINE
+ * text fields had the same wiring; he happened to hit two of them.
+ *
+ * CLICKED fires on every tap regardless of focus state, so it is correct
+ * whatever hid the keyboard in the first place - which matters, because what
+ * hides it on a stray press is NOT established (LVGL indev/group behaviour, a
+ * CANCEL, or z-order are all candidates and were not discriminated). The fix
+ * does not depend on knowing. */
 static lv_obj_t *s_osk_cur = NULL;   /* the on-screen keyboard currently shown */
 
 void ui_osk_show(lv_obj_t *kb)

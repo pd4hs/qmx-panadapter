@@ -65,6 +65,7 @@
 #include "spur_map.h"          // spur_map_set_enabled - /api/settings
 #include "mem_channels.h"      // memory channels - /api/memory
 #include "render_waterfall.h"  // live waterfall tuning - /api/settings display group
+#include "render.h"            // render_set_waterfall_speed_mult - same group
 #include "ft8_pileup.h"        // pileup list - /api/decodes
 #include "ft8_greylist.h"      // grey-list viewer - /api/decodes + greylist_clear
 #include "time_sync.h"         // time_sync_get_effective_source - /api/status time_src
@@ -85,7 +86,8 @@
    tools/patches/apply_lv_event_chain_guard.ps1). Declared here rather than in
    a header because the definition lives in a patched vendor file. */
 extern uint32_t qmx_lv_event_chain_bad;
-#include "util/dxcc.h"        // dxcc_lookup - the decode list's COUNTRY column
+#include "util/dxcc.h"
+#include "util/country.h"     // country_display - one country answer for every screen
 #include "esp_heap_caps.h"
 #include "esp_app_desc.h"
 #include "esp_timer.h"         // web tune 60 s safety timeout
@@ -407,9 +409,15 @@ static void add_ft8_tx_status(cJSON *root)
 // Gated on cat_qmx_fw_at_least(1,4,0) like the Tab5 button. If the Tab5's own
 // tune modal is in use at the same moment the two would fight over the mode -
 // single-operator device, judged acceptable, same as two fingers on one radio.
+// ONE definition of the safety limit. It used to be an inline 60 * 1000000LL at
+// the esp_timer_start_once() below, and /api/status now reports the time left -
+// two numbers that must agree, so there is only one of them.
+#define WEB_TUNE_LIMIT_US (60 * 1000000LL)
+
 static volatile bool s_web_tune_active = false;
 static char          s_web_tune_prior[8] = "USB";
 static esp_timer_handle_t s_web_tune_timer = NULL;
+static volatile int64_t s_web_tune_started_us = 0;
 
 static void web_tune_stop(bool restore)
 {
@@ -450,9 +458,10 @@ static bool web_tune_start(void)
         if (esp_timer_create(&a, &s_web_tune_timer) != ESP_OK) return false;
     }
     s_web_tune_active = true;
+    s_web_tune_started_us = esp_timer_get_time();
     cat_request_mode("TUNE");
     cat_tune_poll_set_active(true);
-    esp_timer_start_once(s_web_tune_timer, 60 * 1000000LL);
+    esp_timer_start_once(s_web_tune_timer, WEB_TUNE_LIMIT_US);
     // Say so on the Tab5 as well (TODO #95d). A tune started from a browser
     // keys the radio for up to a minute while anyone standing at the Tab5 sees
     // nothing at all - the top bar keeps showing the pre-Tune mode, because
@@ -658,6 +667,12 @@ static esp_err_t status_handler(httpd_req_t *req)
 
     cJSON_AddNumberToObject(root, "zoom",        (double)ui_get_zoom_factor());
     cJSON_AddNumberToObject(root, "pan_bins",    (double)ui_get_pan_offset_bins());
+    /* The still-display SETTING, not the viewport it produces. The viewport
+     * above says where the window is NOW; the band-plan drag has to predict
+     * where it will be after the commit, and that depends on whether the view
+     * holds or follows. It was only in /api/settings, which the panadapter page
+     * never reads - so the browser's strip could not mirror ui.c's. */
+    cJSON_AddBoolToObject(root, "still_view", ui_get_still_view());
 
     /* THE VIEWPORT, so the browser stops deriving its own (#298 phase 5).
      *
@@ -1053,6 +1068,14 @@ static esp_err_t status_handler(httpd_req_t *req)
         cat_pwr_swr_async_read(&pw, &swr);
         cJSON_AddNumberToObject(tn, "watts", pw);
         cJSON_AddNumberToObject(tn, "swr",   swr);
+        // Seconds left on the safety timeout. Randy N4OPI asked to be able to
+        // watch power and SWR without keeping the Radio menu open; a tune that
+        // stops on its own needs to say when, or the readout going still reads
+        // as the page having frozen. Clamped at 0 - the timer callback and this
+        // read are on different tasks, so the last poll before the stop lands
+        // can legitimately compute a negative.
+        int64_t left_us = WEB_TUNE_LIMIT_US - (esp_timer_get_time() - s_web_tune_started_us);
+        cJSON_AddNumberToObject(tn, "secs", left_us > 0 ? (int)((left_us + 999999) / 1000000) : 0);
     }
     // Bluetooth, mirroring the Tab5's bottom-bar glyph: "the radio is up" and
     // "something is actually connected" are separate facts.
@@ -1232,6 +1255,16 @@ static esp_err_t cmd_handler(httpd_req_t *req)
              * memory recall and tap-to-tune all move the display straight after
              * the CAT write. The web path simply never did. */
             ui_update_frequency(hz);
+        }
+    } else if (action && strcmp(action, "view_center") == 0) {
+        /* The band-plan knob, from the browser. Deliberately NOT set_freq: the
+         * gesture moves the WINDOW and must be allowed to leave the dial alone,
+         * which a frequency write cannot express. Same entry point the Tab5's
+         * own strip uses, so the two screens cannot drift. */
+        cJSON *item = cJSON_GetObjectItem(root, "hz");
+        if (cJSON_IsNumber(item)) {
+            /* QUEUED, never applied here - see ui_request_bandplan_view(). */
+            ui_request_bandplan_view((int64_t)item->valuedouble);
         }
     } else if (action && strcmp(action, "set_band") == 0) {
         cJSON *item = cJSON_GetObjectItem(root, "hz");
@@ -2329,9 +2362,25 @@ static esp_err_t ss_bmp_handler(httpd_req_t *req)
     memcpy(&header[58], &g_mask,    4);
     memcpy(&header[62], &b_mask,    4);
 
+    // Gyula HA3HZ, 2026-09-17: "If I don't include the time and location in
+    // the screenshot filename, the image itself doesn't convey much
+    // information... have the date and time included in the screenshot
+    // filename; this would save me from having to use the keyboard every
+    // time." "inline" (not "attachment") is unchanged on purpose - this
+    // still opens/previews in the browser tab exactly as before, but the
+    // SUGGESTED filename a "Save image as" offers now carries the moment
+    // it was taken instead of a fixed "ss.bmp" every single time.
+    char cd[64];
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now, &tm_utc);
+    snprintf(cd, sizeof(cd), "inline; filename=qmx-shot-%04d%02d%02d-%02d%02d%02d.bmp",
+             tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+             tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+
     httpd_resp_set_type(req, "image/bmp");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=ss.bmp");
+    httpd_resp_set_hdr(req, "Content-Disposition", cd);
 
     esp_err_t err = httpd_resp_send_chunk(req, (const char *)header, sizeof(header));
 
@@ -3761,8 +3810,12 @@ static esp_err_t tone_get_handler(httpd_req_t *req)
     if (ft8_qso_get_priority_freq(&partner) && partner > 0)
         cJSON_AddNumberToObject(root, "partner_hz", partner);
 
-    // Whether a change would be accepted right now. A burst mid-flight refuses,
-    // and saying so up front beats offering a control that will fail.
+    // Whether a burst is currently mid-flight - NOT whether a change would be
+    // refused. It won't be: ft8_qso_set_tx_tone_hz() queues the tone and
+    // applies it the moment the burst ends (see its own comment - refusing
+    // outright used to mean "whichever tone the burst started on" for the
+    // rest of the QSO, since roughly 40% of attempts landed mid-burst). This
+    // flag exists so the UI can say so, not so it can pretend to refuse.
     cJSON_AddBoolToObject(root, "busy_tx", ft8_tx_get_status(NULL, 0, NULL) == FT8_TX_ACTIVE);
 
     char *out = cJSON_PrintUnformatted(root);
@@ -4047,8 +4100,34 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
      * cannot be read back is the same silent-state trap as the rest of this
      * file's warnings. */
     cJSON_AddNumberToObject(root, "wspr_dump_cycles", c.wspr_dump_cycles);
-    cJSON_AddNumberToObject(root, "wspr_duty_pct", c.wspr_duty_pct);
+    cJSON_AddNumberToObject(root, "wspr_tx_cycles", c.wspr_tx_cycles);
+    cJSON_AddNumberToObject(root, "wspr_rx_cycles", c.wspr_rx_cycles ? c.wspr_rx_cycles : 4);
+    /* Added 2026-09-18: settable on the Tab5's drawer only, and it is not a
+       cosmetic flag - claiming GPS stops the Tab5 maintaining the radio's
+       clock, so a wrong answer costs FT8 timing. See #173. */
+    cJSON_AddBoolToObject(root, "qmx_gps", c.qmx_gps);
     cJSON_AddNumberToObject(root, "wspr_tx_dbm",   c.wspr_tx_dbm);
+    /* ⛔ BAND NAMES, NEVER THE MASK. wspr_hop_mask is a bitmask over kBands'
+     * own index order, so publishing the number would ask the operator to know
+     * an internal encoding - the exact thing the swr_limit_x10 row was rewritten
+     * to stop doing. The device owns the table, so it does the conversion and
+     * the browser only ever sees "40,30,20".
+     *
+     * ⚠ There is deliberately NO separate wspr_hop_en here. The Tab5 derives it
+     * (hopping is on exactly when more than one band is ticked), and a second
+     * switch would be a second thing to get wrong - see hop_toggled_cb(). */
+    {
+        int nb = 0;
+        const wspr_band_t *bl = wspr_bands(&nb);
+        char hops[96]; int hn = 0; hops[0] = 0;
+        for (int i = 0; i < nb && i < 16; i++) {
+            if (!(c.wspr_hop_mask & (1u << i))) continue;
+            hn += snprintf(hops + hn, sizeof(hops) - hn, "%s%s",
+                           hn ? "," : "", bl[i].name);
+            if (hn >= (int)sizeof(hops)) break;
+        }
+        cJSON_AddStringToObject(root, "wspr_hop_bands", hops);
+    }
     // ARRL Field Day (#210, Randy N4OPI wanted the Filter modal reachable from the
     // browser). Everything else in that modal was already here; this was the gap.
     cJSON_AddBoolToObject(root,   "field_day_en", c.field_day_en);
@@ -4088,6 +4167,9 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(d, "wf_contrast_db", c.wf_contrast_db);
     cJSON_AddNumberToObject(d, "wf_floor_blend", c.wf_floor_blend);
     cJSON_AddNumberToObject(d, "wf_window",      c.wf_window);
+    /* Added 2026-09-18: it was a Tab5-drawer setting only, while every other
+       waterfall control on the same drawer row was already here. */
+    cJSON_AddNumberToObject(d, "wf_speed_mult",  c.wf_speed_mult);
     cJSON_AddNumberToObject(d, "colormap",       c.colormap_idx);
     cJSON_AddNumberToObject(d, "brightness",     c.brightness_pct);
     cJSON_AddNumberToObject(d, "sleep_min",      c.display_sleep_min);
@@ -4270,18 +4352,19 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
         settings_set_wspr_tx_en(cJSON_IsTrue(it));
         wspr_sched_dirty = true;
     }
-    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "wspr_duty_pct"))) {
-        /* An exact allow-list, not a range: this is a literal 1-in-N period
-         * now (see roll_next_tx_cycle() in wspr_rx.c), and any value outside
-         * the option list the web/Tab5 UIs actually offer would silently
-         * become a period nobody chose. 0..50 used to be a valid RANGE when
-         * this meant a percentage; it is not one any more. */
+    /* The schedule is two plain counts now - transmit this many cycles, then
+     * receive this many, repeating - so these are RANGES rather than the exact
+     * allow-list "1 in N" needed. That allow-list existed because a value
+     * outside the dropdown became a period nobody chose; a count cannot do
+     * that, it just is what it says. tx 0 is receive-only; rx is never 0,
+     * which would key the radio continuously (see settings.h). */
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "wspr_tx_cycles"))) {
         int v = it->valueint;
-        static const int allowed[] = { 0, 2, 3, 4, 5, 10 };
-        bool ok = false;
-        for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
-            if (v == allowed[i]) { ok = true; break; }
-        if (ok) { settings_set_wspr_duty_pct((uint8_t)v); wspr_sched_dirty = true; }
+        if (v >= 0 && v <= 4) { settings_set_wspr_tx_cycles((uint8_t)v); wspr_sched_dirty = true; }
+    }
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "wspr_rx_cycles"))) {
+        int v = it->valueint;
+        if (v >= 1 && v <= 20) { settings_set_wspr_rx_cycles((uint8_t)v); wspr_sched_dirty = true; }
     }
     /* Re-roll which cycle transmits next, or the TX countdown goes on
      * describing the previous setting until the next cycle boundary - up to two
@@ -4289,7 +4372,28 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
      * values are passed in rather than re-read: this is the httpd task. */
     if (wspr_sched_dirty)
         wspr_rx_tx_schedule_reset(settings_get_wspr_tx_en(),
-                                  settings_get_wspr_duty_pct());
+                                  settings_get_wspr_tx_cycles(),
+                                  settings_get_wspr_rx_cycles());
+    /* "40,30,20" -> mask, matched against the device's own table so an unknown
+       name is ignored rather than guessed at. Hopping follows the same rule the
+       Tab5 uses: on when more than one band is selected. */
+    if (cJSON_IsString(it = cJSON_GetObjectItem(root, "wspr_hop_bands"))) {
+        const char *txt = cJSON_GetStringValue(it);
+        int nb = 0;
+        const wspr_band_t *bl = wspr_bands(&nb);
+        uint16_t mask = 0;
+        char tmp[96];
+        snprintf(tmp, sizeof(tmp), "%s", txt ? txt : "");
+        for (char *tok = strtok(tmp, ","); tok; tok = strtok(NULL, ",")) {
+            while (*tok == ' ') tok++;
+            char *e = tok + strlen(tok);
+            while (e > tok && (e[-1] == ' ' || e[-1] == 'm' || e[-1] == 'M')) *--e = 0;
+            for (int i = 0; i < nb && i < 16; i++)
+                if (strcasecmp(tok, bl[i].name) == 0) { mask |= (uint16_t)(1u << i); break; }
+        }
+        settings_set_wspr_hop_mask(mask);
+        settings_set_wspr_hop_en(__builtin_popcount(mask) > 1);
+    }
     if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "wspr_tx_dbm"))) {
         int v = it->valueint;
         /* Clamped to 0..37, which is what BOTH dropdowns can display - not
@@ -4375,6 +4479,7 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     BOOLTOP("bt_mouse_en",       settings_set_bt_mouse_en);
     BOOLTOP("pskreporter_en",    settings_set_pskreporter_en);
     BOOLTOP("greylist_en",       settings_set_greylist_en);
+    BOOLTOP("qmx_gps",           settings_set_qmx_gps);
     // Fox/Hound: 0 off, 1 guided, 2 automatic. A number rather than a bool
     // because it is a ladder, not a switch - see ft8_hound.h.
     {
@@ -4500,6 +4605,15 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
             if (pct > 100) pct = 100;
             render_waterfall_set_floor_blend((float)pct / 100.0f);
             settings_set_wf_floor_blend((uint8_t)pct);
+        }
+        if (cJSON_IsNumber(v = cJSON_GetObjectItem(disp, "wf_speed_mult"))) {
+            int m = (int)v->valuedouble;
+            if (m < 1) m = 1;
+            if (m > 4) m = 4;
+            /* Apply AND store, same as every slider in this block - storing
+               alone leaves the live waterfall on the old value until reboot. */
+            render_set_waterfall_speed_mult((uint8_t)m);
+            settings_set_wf_speed_mult((uint8_t)m);
         }
         if (cJSON_IsNumber(v = cJSON_GetObjectItem(disp, "wf_window"))) {
             uint8_t idx = (uint8_t)v->valuedouble; if (idx > 2) idx = 0;
@@ -4818,7 +4932,7 @@ static esp_err_t wspr_handler(httpd_req_t *req)
              * reason: the browser has the width. Falls back the way the Tab5's
              * own line does when the callsign is not in the DXCC table. */
             {
-                const char *full = dxcc_lookup(dx.call);
+                const char *full = country_display(dx.call, 64);
                 cJSON_AddStringToObject(o, "country",
                     (full && full[0]) ? full : (dx.cty[0] ? dx.cty : dx.grid));
             }
@@ -4895,7 +5009,7 @@ static esp_err_t wspr_handler(httpd_req_t *req)
          * FT8 list already makes. Looked up from the callsign here rather than
          * stored, so the spot struct stays small. */
         {
-            const char *full = dxcc_lookup(snap[i].call);
+            const char *full = country_display(snap[i].call, 64);
             cJSON_AddStringToObject(o, "country", full ? full : "");
         }
         cJSON_AddNumberToObject(o, "utc",   (double)snap[i].cycle_utc);
@@ -5015,7 +5129,7 @@ static esp_err_t decodes_handler(httpd_req_t *req)
         // to three letters; a browser window has room for "Czech Republic", and
         // a name you can read beats a code you have to decode.
         {
-            const char *cty = dxcc_lookup(r->call);
+            const char *cty = country_display(r->call, 64);
             if (cty && cty[0]) cJSON_AddStringToObject(o, "cty", cty);
         }
         cJSON_AddNumberToObject(o, "snr",  r->last_snr_db);

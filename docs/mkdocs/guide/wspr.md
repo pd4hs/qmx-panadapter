@@ -26,23 +26,22 @@ The left pane is a log, not a live list of who is on frequency. Spots stay where
 |---|---|
 | **S** | The letter this station is marked with on the waterfall for that cycle — see [Which trace is which](#which-trace-is-which) below. Blank once the cycle it belongs to has scrolled out of the picture |
 | **UTC** | The cycle this spot came from |
-| **BND** | The band it was heard on, in metres. Blank for spots recorded before v1.10.5, and worth having the moment band hopping is on |
 | **CALL** | The station heard |
 | **GRID** | Their Maidenhead locator, as transmitted |
-| **COUNTRY** | Country from the callsign prefix |
-| **SNR** | Signal-to-noise, in the WSPR convention (a 2500 Hz reference — figures around −25 dB are entirely normal and perfectly decodable) |
-| **DRF** | Drift, in Hz per minute. A stable transmitter reads 0 |
-| **TONE** | Where in the 200 Hz sub-band they were heard |
+| **COUNTRY** | Country from the callsign prefix, spelled out where it fits and shortened where it does not - never a 3-letter code |
+| **BND** | The band it was heard on, in metres. Blank for spots recorded before v1.10.5, and worth having the moment band hopping is on |
 | **PWR** | The power **they declared**, not a measurement |
-| **KM / BRG** | Great-circle distance and bearing from your grid. The heading reads **MI** if you have chosen miles — see [Settings](settings.md) |
+| **SNR** | Signal-to-noise, in the WSPR convention (a 2500 Hz reference — figures around −25 dB are entirely normal and perfectly decodable) |
+| **TONE** | Where in the 200 Hz sub-band they were heard |
+| **DR** | Drift: how far the sender moved during the transmission. A stable, oven- or GPS-referenced transmitter reads +0; a crystal warming through the burst reads +1 or -2. Whole Hz, which is what wsprnet publishes, and a coarser measurement than TONE beside it - it is the difference between two half-window estimates, so read a trend across several spots rather than one |
 | **DT** | How far into the two-minute cycle that transmission actually started, in seconds. **Nominal is +1.0**, because a WSPR transmission begins one second into its even minute — so a value far from that is the other station's clock rather than anything at your end |
+| **KM** | Great-circle distance from your grid. The heading reads **MI** if you have chosen miles — see [Settings](settings.md). A leading `~` means the distance came from the station's country rather than its grid |
 
 Below the list:
 
 - **DX** — the furthest station of the session, which is usually the number you actually want.
-- **HISTORY** — stations per cycle, oldest on the left. A single snapshot cannot tell an opening band from a closing one; a row of bars can.
 - **WSPRNET** — whether spots are being published, and how many can be. **"N of M publishable"** is the publication gate: a station is only sent to wsprnet once it has been heard **more than once**, so N is how many of the M calls heard so far are eligible. This is also why a site like wspr.rocks can show fewer unique calls than this page reports hearing — it only ever received the publishable ones.
-- **Clear** — empties the decode list. It asks first, because the list is also the upload queue: anything not yet sent to wsprnet goes with it, and the publishable count resets.
+- **Flush** — empties the decode list. It asks first, because the list is also the upload queue: anything not yet sent to wsprnet goes with it, and the publishable count resets.
 
 !!! tip "With a mouse, point at a trace to see whose it is"
 
@@ -126,7 +125,11 @@ There is no separate "allow transmitting" setting. The **TX** button on the page
 
 #### Calibrate Power
 
-Before Declared power can offer anything real, the current band needs calibrating. **Calibrate Power** sweeps the QMX's *Max. PA voltage* through 45 points on a **dummy load** — not the antenna — and records the real RF output at each with the radio's own `PC;` readback. Takes a few minutes; the result is saved for that band and used from then on.
+Before Declared power can offer anything real, the current band needs calibrating. **Calibrate Power** sweeps the QMX's *Max. PA voltage* on a **dummy load** — not the antenna — and records the real RF output at each step with the radio's own `PC;` readback. The result is saved for that band and used from then on.
+
+*(v1.14.4)* The sweep **stops at your own Max. PA voltage**, and the window shows that figure before you start — so a 9 V QMX, or one you have deliberately limited, is never driven past the setting you chose. It also **stops early once the measured power stops rising**, which is what happens above your supply voltage: on an 8 V supply every step above ~8 V would otherwise re-measure the same watts for minutes of pointless key-down. Bruce N9JCV found both.
+
+Because the sweep can end early, a shorter results table is normal rather than a failure — the window says which of the two limits ended it.
 
 You reach it two ways: the **"Calibrate this band"** button that appears in place of Declared power (or Output power, on other modes) whenever the current band has no data yet, or **"Recalibrate this band"** in the same place once it does — for redoing a band after a change to your antenna or feedline.
 
@@ -150,11 +153,28 @@ A separate slider, filed next to Calibrate Power, sets the radio's output for ev
 
 **If you intend to beacon on WSPR for hours, feed the QMX from a lower supply.** The QMX accepts **6.0 to 12.0 V**, and running it at around 9 V means less voltage to throw away as heat anywhere in the radio. This is the one thing that helps which no firmware setting can do for you.
 
-#### Duty cycle
+#### Transmit schedule *(changed in v1.14.5)*
 
-How much of the time you are willing to transmit, as a fraction of cycles: **0%** (receive only), **10%**, **20%**, **33%** or **50%**. Each cycle is decided independently at random, which is deliberate — a fixed pattern would have you transmitting in step with everyone else who chose the same setting.
+Two numbers describe one repeating group: **Transmit cycles**, then **Receive cycles**.
 
-WSPR convention is to transmit a minority of the time and listen the rest. 20% is a reasonable default; 50% is a lot on a shared, very quiet sub-band.
+Set transmit to 2 and receive to 8, and the beacon transmits for two cycles, listens for eight, and repeats for ever. The period is simply the two added together — ten cycles, twenty minutes — and the Tab5 spells it out under the two controls as you change them:
+
+> Transmit 2, then listen 8 — repeating every 20 min. Transmitting 20% of the time.
+
+| Transmit | Receive | Pattern, repeating | Period |
+|---|---|---|---|
+| 1 | 4 | Tx Rx Rx Rx Rx | 10 min |
+| 1 | 9 | Tx Rx ×9 | 20 min |
+| 2 | 8 | Tx Tx Rx ×8 | 20 min |
+| 2 | 3 | Tx Tx Rx Rx Rx | 10 min |
+
+Setting transmit to **Receive only** never keys the radio, and greys out the receive count — with no transmission there is no group to space out.
+
+**Why two numbers and not a duty cycle.** This used to be "1 in N" plus a separate "bursts per transmission", and that pair had no agreed meaning. "1 in 5" plainly means one cycle in five, and with a single burst that is exactly what it did — but ask for two bursts and the phrase stops saying anything. Does the group grow into the listening time, or is the listening time kept? Two people can read it two ways, and did. Two counts cannot be read two ways.
+
+**Your existing setting is carried over exactly.** A Tab5 upgrading from v1.14.4 or earlier keeps the schedule it was already running, cycle for cycle — the old "1 in 5" becomes 1 transmit and 4 receive, which is the same thing said plainly.
+
+**Transmitting more means keying the finals more.** Two cycles in a row give a distant receiver a second chance at you when the first falls in a fade, which is why the QMX's own beacon offers it — and it doubles your share of key-down time. Pick the declared power to match; see **Declared power** above.
 
 #### Band hopping
 
@@ -174,15 +194,22 @@ It needs WiFi and your callsign and grid.
 
 ### 4. Transmitting
 
-With a callsign and grid set and a duty cycle above 0%, the **TX** button on the page arms the station. Which cycles actually transmit is decided by the duty cycle, and the button shows what is happening.
+With a callsign and grid set and a transmit count other than **Receive only**, the **TX** button on the page arms the station. Which cycles actually transmit is decided by the transmit schedule, and the button shows what is happening.
 
-**The countdown on the button is the time until a real transmission.** The duty-cycle decision is taken in advance, so `TX ON next 6:14` means a burst is coming in six minutes and fourteen seconds — not that a cycle boundary is due and might or might not be used.
+**The countdown on the button is the time until a real transmission.** The schedule is worked out in advance, so `TX ON next 6:14` means a burst is coming in six minutes and fourteen seconds — not that a cycle boundary is due and might or might not be used.
 
 A few things worth knowing before you leave it running:
 
 - **Your radio is keyed for real,** for about 110 seconds at a time. Make sure it is connected to an antenna or a dummy load, and that the power it is producing matches what you declared.
 - **SWR protection still applies.** If the SWR limit in **Radio -> SWR protection** is exceeded, transmitting stops.
 - **The Tab5 wakes up on the page you left it on, but not transmitting.** It returns to the WSPR page after a power cycle and starts receiving; the **TX** button is off, so it will not resume beaconing on its own. Switch it on again when you are ready.
+- **Split stops it, and says so.** WSPR is transmitted on the dial frequency, and
+  the spot you publish names that frequency. If your radio is in split it keys VFO
+  B while still reporting VFO A, so every spot would name somewhere the signal
+  never was. Before each transmission the Tab5 asks the radio, and if split is on
+  it holds the burst and shows **TX held - radio is in SPLIT, clear VFO B**. It
+  will not clear it for you: that is your setting, and on the QMX split cannot be
+  cleared over the cable anyway — use the radio's own menu or power-cycle it.
 - **Simulation mode blocks every byte.** If you want to watch the mechanics without keying anything, turn on **FT8 Simulation Mode** in the drawer; it interlocks WSPR TX as well.
 
 ---

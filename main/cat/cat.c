@@ -149,6 +149,11 @@ static volatile uint32_t s_pending_ssb_bw = 0;
  * mode, so it gets none of that protection unless we apply it ourselves. */
 static volatile uint16_t s_pending_pa_mv10 = 0;      /* set request, 0 = none */
 static volatile bool     s_pa_query_pending = false; /* read it back          */
+/* Ask the radio whether IT is in split, for callers that are about to transmit
+ * and need the answer to be the RADIO's rather than ours. s_split_engaged says
+ * only whether WE put it there; a split the operator (or a menu visit) left on
+ * is invisible to it. See cat_request_split_read(). */
+static volatile bool     s_split_query_pending = false;
 /* Set when OUR query goes out, cleared by the reply that answers it.
  * ⛔ WITHOUT THIS THE PARSER STEALS OTHER PEOPLE'S MM REPLIES. s_mm_resp is
  * shared by every MM user in this file, so an unrelated MM Get that happens
@@ -289,6 +294,30 @@ void cat_request_pa_voltage_x10(uint16_t v_x10)
 void cat_query_pa_voltage(void)
 {
     s_pa_query_pending = true;
+}
+
+/* ⭐ WHY THIS EXISTS: a WSPR beacon in split transmits on VFO B while FA; still
+ * reports A, so the Tab5, wsprnet and everyone who copies the spot are told a
+ * frequency the signal was never on. John W5JSS, 2026-09-18: his WSPR was not
+ * being spotted, and it started working the moment he "cleared the B VFO
+ * display" - the QMX's dual-VFO state, which this file already records as not
+ * clearable over CAT (only MU; or a power cycle).
+ *
+ * Deliberately a QUERY and nothing more. Standing someone's split down for them
+ * is what cw_split_maintain() explicitly refuses to do - "an operator running
+ * their own split has not asked us to interfere" - and that rule does not stop
+ * applying because the mode changed. The caller refuses to key instead. */
+void cat_request_split_read(void)
+{
+    s_split_query_pending = true;
+}
+
+/* -1 unknown / not answered yet, 0 simplex, 1 split. NEVER treat -1 as split:
+ * refusing to transmit on "don't know" would ground the beacon on any radio
+ * that is slow to answer. */
+int cat_get_split_state(void)
+{
+    return s_split_readback;
 }
 
 int16_t cat_get_pa_voltage_x10(void)
@@ -1891,6 +1920,19 @@ static void poll_task(void *arg)
         /* Read Max. PA voltage. Served BEFORE the write below so a
          * request-then-confirm sequence cannot read the stale value - the
          * same ordering the RF-gain path documents. */
+        /* Plain "SP;" - one short query, answered into s_split_readback by the
+         * RX parser. Skipped while WE hold the radio in split for the CW
+         * transmit offset: there the answer is known, and cw_split_maintain()
+         * is already using the same readback for its own verification. */
+        if (s_split_query_pending) {
+            s_split_query_pending = false;
+            if (!s_split_engaged) {
+                s_split_readback = -1;
+                cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"SP;", 3, 200);
+                vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+                continue;
+            }
+        }
         if (s_pa_query_pending) {
             s_pa_query_pending = false;
             const char *q = "MMProtection|Max. PA voltage;";
@@ -2683,6 +2725,23 @@ esp_err_t cat_set_frequency(uint32_t freq_hz)
     return ESP_OK;
 }
 
+bool cat_poll_is_paused(void)
+{
+    return s_poll_paused;
+}
+
+/* Withdraw a parked frequency write, but ONLY if it is still the one the
+ * caller asked for - see the note in cat.h. Anything else in that slot belongs
+ * to someone else and must go out. */
+bool cat_cancel_pending_freq_if(uint32_t freq_hz)
+{
+    if (s_pending_freq_hz != freq_hz) return false;
+    s_pending_freq_hz = 0;
+    ESP_LOGW(TAG, "deferred freq %lu Hz withdrawn by its caller - it never went out",
+             (unsigned long)freq_hz);
+    return true;
+}
+
 esp_err_t cat_set_frequency_forced(uint32_t freq_hz)
 {
     s_last_tx_us = 0;  // bypass the 200 ms rate-limiter for deliberate user writes
@@ -2755,6 +2814,21 @@ esp_err_t cat_set_mode(const char *mode)
         return ESP_ERR_INVALID_ARG;
     }
     if (s_cdc_dev == NULL) return ESP_ERR_INVALID_STATE;
+    // ⛔ WAS THE ONE BLOCKING CDC WRITER IN THIS FILE WITH NO s_poll_paused
+    // GUARD (found 2026-09-16, chasing Randy N4OPI's "web Apply hangs and
+    // loses the QMX, only during an active QSO/CQ exchange, needs a power
+    // cycle" report). Every other blocking write here refuses cleanly while
+    // a burst owns the pipe (cat_gps_tick_sync() just above is the model this
+    // copies) - this one did not, and it is called from ft8_tx_arm()'s Digi
+    // pre-flight (ft8_tx.c) and wspr_tx.c's own pre-TX mode set, both of
+    // which run OUTSIDE ft8_tx's internal lock and can therefore race a
+    // DIFFERENT burst that is already ACTIVE and already owns the pipe -
+    // exactly the shape "only happens mid-exchange, ~50% of the time" points
+    // at. The caller already has a clean-refusal path for a failed pre-flight
+    // (see ft8_tx.c's own comment on aborting before TX; rather than sending
+    // a corrective cat_set_mode() mid-burst); this makes that path reachable
+    // instead of two tasks writing the CDC pipe at once.
+    if (s_poll_paused) return ESP_ERR_INVALID_STATE;  // FT8/WSPR TX owns the pipe
 
     uint64_t now = esp_timer_get_time();
     if (now - s_last_tx_us < 200000) return ESP_ERR_TIMEOUT;

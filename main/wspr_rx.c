@@ -26,6 +26,7 @@
 #include "util/psram_task.h"
 #include "util/maidenhead.h"
 #include "util/dxcc.h"
+#include "util/country.h"
 #include "storage/settings.h"
 #include "fft/kiss_fftr.h"
 #include "wspr_decode.h"
@@ -388,6 +389,25 @@ static bool s_first_tx_forced = false;
 #define WSPR_PA_TARGET_X10 60   /* 6.0 V - about 1 W, per the QMX manual */
 
 static uint8_t s_sched_duty    = 0;    /* the duty this schedule was rolled at */
+/* ---- burst groups (John W5JSS, 2026-09-17) --------------------------------
+ * He asked for two transmissions back to back - "10:46 & 10:48, 11:06 &
+ * 11:08" - which the QMX's own Virtual U3S beacon does and this did not.
+ *
+ * ⛔ "1 in N" COUNTS THE RECEIVE CYCLES AFTER THE GROUP, NOT THE WHOLE PERIOD.
+ * The operator's own definition, and I got it wrong first time:
+ *     1 in 2, 1 burst   ->  Tx Rx          Tx Rx
+ *     1 in 2, 2 bursts  ->  Tx Tx Rx       Tx Tx Rx
+ *     1 in 3, 1 burst   ->  Tx Rx Rx       Tx Rx Rx
+ *     1 in 3, 2 bursts  ->  Tx Tx Rx Rx    Tx Tx Rx Rx
+ * so the real period is (bursts + N - 1) and it GROWS with the burst count.
+ *
+ * I first read N as the group-start-to-group-start period, which holds the
+ * groups still and shortens the silence instead. That needed a clamp to stop a
+ * group swallowing its own period, the clamp was off by one, and 1-in-2 with 2
+ * bursts transmitted continuously on the bench. Rolling from the LAST burst -
+ * which is what this code did before I touched it - needs no clamp at all,
+ * because N-1 silent cycles always follow whatever the group did. */
+static uint8_t s_burst_done    = 0;    /* bursts already sent in this group */
 
 /* ⛔ "1 IN N", NOT A PERCENTAGE - A SCHEDULE THE OPERATOR CAN PREDICT, NOT A
  * DICE ROLL THAT HAPPENS TO AVERAGE OUT TO ONE.
@@ -403,7 +423,7 @@ static uint8_t s_sched_duty    = 0;    /* the duty this schedule was rolled at *
  * Operator, 2026-09-12: "No % but only 1 in 2, 1 in 3, 1 in 4, 1 in 5, 1 in 10
  * - this way we keep consistency and operator knows the TX plan." So `duty` is
  * now the literal period N: cycle `after + N` transmits, every time, no roll.
- * N >= 2 always (see kDuty[] in wspr_screen_view.c - the option list has no
+ * The receive count is never 0 (settings.h - the option list has no
  * "1 in 1"), so the old back-to-back problem cannot recur by construction and
  * the separate min_gap mechanism it needed is gone with it.
  *
@@ -411,10 +431,14 @@ static uint8_t s_sched_duty    = 0;    /* the duty this schedule was rolled at *
  * value (NVS key, /api/settings field, config export) is unchanged, only its
  * meaning is, and renaming it would be a bigger and less honest diff than the
  * behaviour change itself. */
-static int64_t roll_next_tx_cycle(int64_t after, uint8_t duty)
+/* First transmit cycle of the NEXT group, given the last transmit cycle of this
+ * one. The group is tx_cycles of transmit followed by rx_cycles of receive, so
+ * the next group starts one cycle after the last transmit plus the listening
+ * time - and the period is simply tx + rx, with nothing to infer. */
+static int64_t roll_next_group_cycle(int64_t last_tx_cycle, uint8_t rx_cycles)
 {
-    if (duty == 0) return -1;
-    return after + (int64_t)duty;
+    if (rx_cycles < 1) rx_cycles = 1;   /* 0 would key the radio continuously */
+    return last_tx_cycle + 1 + (int64_t)rx_cycles;
 }
 
 /* ⛔ THE TX-ENABLE ENGAGE BELOW IS ONE SYNCHRONOUS CHECK, AND THE CACHE IS
@@ -560,7 +584,7 @@ static void wspr_pa_guard_restore_if_pending(void)
     if (back == 0) return;   /* nothing owed */
 
     bool want_reduced = settings_get_wspr_tx_en() && settings_get_wspr_pa_reduce()
-                       && settings_get_wspr_duty_pct() > 0;
+                       && settings_get_wspr_tx_cycles() > 0;
     if (want_reduced) return;   /* still genuinely wanted - not this function's job */
 
     int16_t cur = cat_get_pa_voltage_x10();
@@ -584,23 +608,24 @@ static void wspr_pa_guard_restore_if_pending(void)
              back / 10, back % 10);
 }
 
-void wspr_rx_tx_schedule_reset(bool tx_en, uint8_t duty_pct)
+void wspr_rx_tx_schedule_reset(bool tx_en, uint8_t tx_cycles, uint8_t rx_cycles)
 {
     /* ⚠ Takes the two values it needs as ARGUMENTS rather than reading the
      * settings itself. Both callers are UI paths - the Tab5's TX button on
      * taskLVGL and the /api/settings handler on httpd - and settings_load_all()
      * is a multi-kilobyte struct on the caller's stack. That is the bug class
      * this board has hit four times; see "Task stacks on this board are TINY". */
-    if (!tx_en || duty_pct == 0) {
+    if (!tx_en || tx_cycles == 0) {
         s_next_tx_cycle   = -1;
         s_sched_duty      = 0;
+        s_burst_done      = 0;
         s_first_tx_forced = false;
         /* Disarming (or duty going to 0) deserves the same immediate
          * attempt arming gets below, not a wait for the next WSPR cycle's
          * own check - see wspr_pa_guard_restore_if_pending()'s own
          * comment. A no-op if nothing is owed or the guard has genuinely
          * been switched off, so calling it unconditionally here costs
-         * nothing on the common paths (duty_pct==0 is rare; !tx_en is the
+         * nothing on the common paths (tx_cycles==0 is rare; !tx_en is the
          * disarm case this exists for). */
         wspr_pa_guard_restore_if_pending();
         return;
@@ -628,6 +653,27 @@ void wspr_rx_tx_schedule_reset(bool tx_en, uint8_t duty_pct)
         s_next_tx_cycle   = cycle_now + 1;
         s_first_tx_forced = true;
         ESP_LOGI(TAG, "TX enabled - first burst is the next cycle, duty applies from the one after");
+        /* ⛔ APPLY THE DECLARED POWER HERE TOO. This is the moment the operator
+         * says "transmit", and the only moment where CAT is certainly up, the
+         * band is certainly known, and their intent is unambiguous.
+         *
+         * wspr_rx_start() already calls this - but on a Tab5 that BOOTS into
+         * WSPR it runs at ~8 s while CAT does not open until ~17 s, so
+         * cat_get_frequency() is 0, the band is unknown and the apply refuses.
+         * That is this project's boot trap for the fourth time (the CW pitch,
+         * the output-power re-assert, the top bar) and the shape is always the
+         * same: the entry path with no transition is the one that gets missed.
+         *
+         * Measured, 2026-09-19: boot restored WSPR at 8.2 s, the operator left
+         * to FT8 (which correctly re-asserted 12.0 V), came back to WSPR at
+         * 173 s, enabled TX at 191 s - and the burst went out at 12.0 V = 3.8 W
+         * while declaring 30 dBm (1 W). wsprnet publishes the DECLARED figure,
+         * so that is a wrong number sent worldwide as well as ~110 s of finals
+         * at full power, which is how this radio lost its finals once before.
+         *
+         * Cheap and idempotent: one MM write, and a no-op when the voltage is
+         * already right. */
+        wspr_pa_apply_declared_dbm(settings_get_wspr_tx_dbm());
         /* ⛔ TURN THE PA DOWN NOW, NOT AT THE BOUNDARY - or the first burst is
          * held and the operator waits another full cycle.
          *
@@ -677,9 +723,10 @@ void wspr_rx_tx_schedule_reset(bool tx_en, uint8_t duty_pct)
         /* Nothing has just transmitted here - this is transmitting being
          * switched on, or the duty being changed mid-session - so the very
          * next cycle is allowed. */
-        s_next_tx_cycle = roll_next_tx_cycle(cycle_now, duty_pct);
+        s_next_tx_cycle = roll_next_group_cycle(cycle_now, rx_cycles);
     }
-    s_sched_duty    = duty_pct;
+    s_sched_duty    = (uint8_t)((tx_cycles ? tx_cycles : 1) * 32u +
+                                (rx_cycles ? rx_cycles : 1));
 
     /* ⭐ PRE-WARM THE PA-GUARD QUERY, not wait for the first cycle to ask.
      *
@@ -816,10 +863,21 @@ static void file_spot(const wspr_decode_result_t *r, int64_t cycle_utc,
     qmx_settings_t qs;
     settings_load_all(&qs);
     double mlat, mlon, tlat, tlon;
-    if (qs.my_grid[0] && maidenhead_to_latlon(qs.my_grid, &mlat, &mlon) &&
-        maidenhead_to_latlon(sp.grid, &tlat, &tlon)) {
-        sp.km          = (int32_t)haversine_km(mlat, mlon, tlat, tlon);
-        sp.bearing_deg = (int16_t)bearing_deg(mlat, mlon, tlat, tlon);
+    if (qs.my_grid[0] && maidenhead_to_latlon(qs.my_grid, &mlat, &mlon)) {
+        if (maidenhead_to_latlon(sp.grid, &tlat, &tlon)) {
+            sp.km          = (int32_t)haversine_km(mlat, mlon, tlat, tlon);
+            sp.bearing_deg = (int16_t)bearing_deg(mlat, mlon, tlat, tlon);
+        } else {
+            /* No usable grid. Fall back to the callsign's country centroid so
+             * the row is not simply blank - marked approximate, and ONLY here,
+             * because the grid above is an order of magnitude better and must
+             * always win when it exists. */
+            double km = 0.0;
+            if (country_centroid_km(sp.call, mlat, mlon, &km)) {
+                sp.km        = (int32_t)km;
+                sp.km_approx = true;
+            }
+        }
     }
     sp.dial_hz = s_cycle_dial_hz;   /* the band it was HEARD on - see wspr_dec_job_t */
     wspr_spots_add(&sp);
@@ -1207,7 +1265,35 @@ uint32_t wspr_rx_waterfall_seq(void) { return s_wf_seq; }
  * which breaks WSPR timing outright, and overwriting corrupts a decode in
  * flight. With a 105 s budget against a 120 s cycle this should never fire; it
  * exists so that if it does, it is visible rather than silently wrong. */
-#define WSPR_PCM_SLOTS 2
+/* ⛔⛔ ONE, NOT TWO, AND THE SECOND ONE WAS STARVING THE DECODER (2026-09-19).
+ *
+ * The page's PSRAM claim is what makes wspr_find_candidates() fail: entering
+ * WSPR takes free PSRAM from 11,777 KB to ~2,090 KB, and the candidate search
+ * needs ~2.3 MB of what is left. Measured on this bench, the same cycle, twice:
+ *
+ *   E wspr_rx: NO MEMORY for the candidate search - it needs ~2.3 MB and
+ *     PSRAM has 2877 KB free (largest block 2560 KB)
+ *
+ * so the page was losing that toss most cycles and reporting it, until today,
+ * as a plain "0 candidate(s)" - a dead band with strong traces on the carpet.
+ *
+ * This slot is 2,812 KB of that claim, and it buys ONE thing: the ability to
+ * start capturing the next cycle while the previous one is still decoding.
+ * Measured, that never happens - a decode is 30-45 s of a 120 s cycle, and the
+ * budget itself is 115 s. The second buffer has been insurance against an
+ * overrun that the timing does not permit, paid for with the memory the
+ * decoder needed to work at all.
+ *
+ * ⚠ The drop path below is now reachable in principle rather than in theory,
+ * so it keeps its loud log line. If "DROPPING this window" ever appears, the
+ * decode really did outrun the cycle and THAT is the thing to fix - not this
+ * number. Putting it back to 2 would buy the overrun and re-break the search.
+ *
+ * ⚠ ALSO NOT THE WHOLE STORY. With the search's memory guaranteed there were
+ * still cycles that found 20 candidates on the right frequencies and decoded
+ * none of them. That is a separate question, one stage downstream, and this
+ * change is what makes it possible to ask it at all. */
+#define WSPR_PCM_SLOTS 1
 
 /* Up to ~20 s of retries: an FT8 slot is 15 s and that is the longest the
  * previous page can hold its pool after the mode has changed. */
@@ -1413,6 +1499,23 @@ static void decode_one_window(int16_t *pcm, int64_t cycle_utc)
   next_pass:
     ncand = wspr_find_candidates(pcm, CAP_SAMPLES, SEARCH_LO_HZ, SEARCH_HI_HZ,
                                   cands, WSPR_MAX_CANDS);
+    /* ⛔ OUT OF MEMORY IS NOT AN EMPTY BAND, AND IT USED TO PRINT AS ONE.
+     * wspr_find_candidates() needs ~2.3 MB of FFT scratch and entering this
+     * page leaves only ~2.1-2.9 MB of PSRAM; when it lost, it returned 0 and
+     * the cycle line said "0 candidate(s)" - identical to a dead band, which
+     * is exactly how this hid behind a day of wrong hypotheses while the
+     * operator watched strong traces decode nothing. Say it, at ERROR, with
+     * the number that explains it. */
+    if (ncand == WSPR_CANDS_NOMEM) {
+        ESP_LOGE(TAG, "cycle %lld: NO MEMORY for the candidate search - it needs "
+                      "~2.3 MB and PSRAM has %u KB free (largest block %u KB). "
+                      "This cycle decodes NOTHING, and it is not the band.",
+                 (long long)cycle_utc,
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+                 (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+        set_status("out of memory - no decode");
+        ncand = 0;
+    }
     if (pass == 0) {
         nmarks = ncand > WSPR_MARKS_MAX ? WSPR_MARKS_MAX : ncand;
         for (int i = 0; i < nmarks; i++) {
@@ -1427,6 +1530,33 @@ static void decode_one_window(int16_t *pcm, int64_t cycle_utc)
          * carpet shows where the search is about to look, and each mark turns
          * into its letter as that line decodes. */
         marks_letter_and_publish(marks, mscore, nmarks, cycle_utc);
+
+        /* ⚠ TEMPORARY DIAGNOSTIC (2026-09-19) - remove once the "several
+         * strong traces, one decode" question is settled.
+         *
+         * Operator, looking at five traces and one decode: "it is not an
+         * argument for me that its the stronger signals that are difficult to
+         * decode". He is right, and it kills the hypothesis that a 20-deep cap
+         * ranked by comb score squeezes loud signals out - the loudest would
+         * rank FIRST. So the question is no longer "how many candidates" but
+         * "WHERE were they", and this is the only way to know: the '?' marks
+         * on the carpet are filtered for the noise tail, so what is drawn is
+         * not the raw list.
+         *
+         * One line per cycle at INFO, which is nothing next to the per-decode
+         * lines already there. Frequency and comb score for each, so a
+         * candidate sitting on a visible trace can be told from one sitting on
+         * noise. */
+        {
+            char cl[320];
+            cl[0] = '\0';          /* ncand can be 0 - never print a stale buffer */
+            size_t o = 0;
+            for (int i = 0; i < ncand && o < sizeof(cl) - 24; i++)
+                o += (size_t)snprintf(cl + o, sizeof(cl) - o, "%s%.1f/%.0f",
+                                      i ? " " : "", cands[i].freq_hz,
+                                      cands[i].comb_score);
+            ESP_LOGI(TAG, "cands(%d): %s", ncand, cl);
+        }
     }
     found_in_pass = 0;
     tried_this_pass = 0;
@@ -1702,7 +1832,7 @@ static void wspr_pa_guard_release(void);
 
 static void wspr_pa_guard_update(const qmx_settings_t *ws)
 {
-    bool want_reduced = ws->wspr_tx_en && ws->wspr_pa_reduce && ws->wspr_duty_pct > 0;
+    bool want_reduced = ws->wspr_tx_en && ws->wspr_pa_reduce && ws->wspr_tx_cycles > 0;
 
     /* ⛔ RETIRED, 2026-09-16 - same operator decision as
      * wspr_pa_guard_engage_if_pending() above ("the wspr finals-protection
@@ -1808,7 +1938,7 @@ static bool wspr_pa_guard_ready(const qmx_settings_t *ws)
     (void)ws;
     return true;
 
-    if (!(ws->wspr_tx_en && ws->wspr_pa_reduce && ws->wspr_duty_pct > 0))
+    if (!(ws->wspr_tx_en && ws->wspr_pa_reduce && ws->wspr_tx_cycles > 0))
         return true;                    /* protection not wanted - nothing to wait for */
     int16_t cur = cat_get_pa_voltage_x10();
     return cur >= 0 && (uint16_t)cur <= WSPR_PA_TARGET_X10;
@@ -1915,11 +2045,14 @@ static void wspr_rx_task(void *arg)
      * precisely so the next few boots can settle it: if fast boots share an
      * alignment that slow boots do not, it is confirmed; if they do not, the
      * cause is elsewhere and this line costs nothing. */
-    ESP_LOGI(TAG, "buffers: cap=%p pcm0=%p pcm1=%p (align %u/%u/%u)",
-             (void *)cap, (void *)s_pcm[0], (void *)s_pcm[1],
-             (unsigned)((uintptr_t)cap      & 63u),
-             (unsigned)((uintptr_t)s_pcm[0] & 63u),
-             (unsigned)((uintptr_t)s_pcm[1] & 63u));
+    /* Every slot, however many there are - this named pcm0 and pcm1 outright
+     * and stopped compiling the moment WSPR_PCM_SLOTS became 1. -Werror=
+     * array-bounds caught it, which is the compiler doing the job a hand-
+     * maintained second copy of a constant always eventually needs. */
+    for (int i = 0; i < WSPR_PCM_SLOTS; i++)
+        ESP_LOGI(TAG, "buffers: cap=%p (align %u)  pcm%d=%p (align %u)",
+                 (void *)cap, (unsigned)((uintptr_t)cap & 63u),
+                 i, (void *)s_pcm[i], (unsigned)((uintptr_t)s_pcm[i] & 63u));
 
     int64_t last_cycle_idx = -1;
 
@@ -2018,34 +2151,60 @@ static void wspr_rx_task(void *arg)
         }
 
         /* ---- is THIS the cycle the schedule picked? --------------------
-         * The roll itself happened earlier (see roll_next_tx_cycle) so that
+         * The roll itself happened earlier (see roll_next_group_cycle) so that
          * the TX button can count down to a real burst instead of to the next
          * mere opportunity. All that is left here is to act on it, and to roll
          * the following one - whether this cycle transmitted or not, so a held
          * or refused burst moves the countdown on rather than leaving it at
          * zero promising something that is not coming. */
-        const bool tx_possible = ws.wspr_tx_en && ws.wspr_duty_pct > 0;
+        const uint8_t sched_tx = ws.wspr_tx_cycles;
+        const uint8_t sched_rx = ws.wspr_rx_cycles ? ws.wspr_rx_cycles : 1;
+        const bool tx_possible = ws.wspr_tx_en && sched_tx > 0;
         if (!tx_possible) {
             s_next_tx_cycle = -1;
             s_sched_duty    = 0;
         } else if (s_next_tx_cycle < last_cycle_idx ||
-                   s_sched_duty != ws.wspr_duty_pct) {
+                   s_sched_duty != (uint8_t)(sched_tx * 32u + sched_rx)) {
             /* Nothing scheduled, the schedule was overtaken (a stalled cycle,
-             * a clock step), or the operator changed the duty. Rolled from
-             * last_cycle_idx - 1 so THIS cycle is the first candidate, which
-             * keeps the old behaviour that a burst can happen in the very
-             * first cycle after transmitting is switched on. */
-            s_next_tx_cycle = roll_next_tx_cycle(last_cycle_idx - 1, ws.wspr_duty_pct);
-            s_sched_duty    = ws.wspr_duty_pct;
+             * a clock step), or the operator changed either count. THIS cycle
+             * becomes the first transmit of a fresh group, which keeps the
+             * behaviour that a burst can happen in the very first cycle after
+             * transmitting is switched on. */
+            s_next_tx_cycle = last_cycle_idx;
+            /* Both counts fold into one comparison value so a change to either
+             * re-rolls. rx is 1-20 and tx is 0-4, so tx*32+rx cannot collide. */
+            s_sched_duty    = (uint8_t)(sched_tx * 32u + sched_rx);
+            /* A re-roll abandons any group in progress: the schedule it was
+             * part of no longer exists. */
+            s_burst_done    = 0;
         }
         const bool tx_this_cycle = tx_possible && s_next_tx_cycle == last_cycle_idx;
         if (tx_this_cycle) {
-            /* Roll the next one now, before anything below can fail. */
-            /* THIS cycle is about to transmit, so the next one is exactly N
-             * cycles from here - guaranteed by roll_next_tx_cycle's own return
-             * (after + N), never a roll that could land back on THIS cycle. */
-            s_next_tx_cycle = roll_next_tx_cycle(last_cycle_idx, ws.wspr_duty_pct);
+            /* Roll the next one now, before anything below can fail.
+             *
+             * With burst_n == 1 this is exactly what it always was: the next
+             * cycle is N from here. With burst_n > 1 the group continues on the
+             * VERY NEXT cycle until it is used up, and only then does the next
+             * group get rolled - from the group's FIRST cycle, so the period is
+             * group-start to group-start and the groups do not drift. */
+            uint8_t tx_n = sched_tx ? sched_tx : 1;
+            s_burst_done++;
+            if (s_burst_done < tx_n) {
+                s_next_tx_cycle = last_cycle_idx + 1;   /* back to back */
+                ESP_LOGI(TAG, "transmit %u of %u in this group - next cycle too",
+                         (unsigned)s_burst_done, (unsigned)tx_n);
+            } else {
+                /* Group finished: rx_cycles of listening follow. */
+                s_next_tx_cycle = roll_next_group_cycle(last_cycle_idx, sched_rx);
+                s_burst_done    = 0;
+            }
         }
+
+        /* Ask the radio about split every cycle while transmit is enabled. The
+         * answer lands a poll or two later and is judged at the NEXT burst, so
+         * this costs one short query and never blocks - the same
+         * request-early-judge-later shape the PA voltage read uses. */
+        if (tx_possible) cat_request_split_read();
 
         if (tx_this_cycle && !wspr_pa_guard_ready(&ws)) {
             /* Loud, and only while it is actually holding something up. */
@@ -2071,18 +2230,54 @@ static void wspr_rx_task(void *arg)
         } else if (tx_this_cycle) {
             wspr_tx_request_t req;
             char err[80] = "";
-            if (!ws.my_callsign[0] || !ws.my_grid[0]) {
+            /* ⛔ NEVER BEACON IN SPLIT.
+             *
+             * WSPR is transmitted on the dial frequency by definition, and the
+             * spot published to wsprnet carries that frequency. In split the
+             * radio keys VFO B while FA; still reports A, so every spot is a
+             * measurement of somewhere the signal never was - published to a
+             * global database, unattended, for hours. That is the same rule as
+             * never fabricating a signal report, with a wider blast radius.
+             *
+             * John W5JSS, 2026-09-18: his WSPR was not being spotted at all,
+             * and it started working the moment he "cleared the B VFO display".
+             * The QMX's dual-VFO state is not clearable over CAT (only MU; or a
+             * power cycle - see the CAT notes), so the firmware cannot fix this
+             * for him even if it wanted to.
+             *
+             * ⛔ AND IT DELIBERATELY DOES NOT TRY. cw_split_maintain() refuses
+             * to clear a split it did not set - "an operator running their own
+             * split has not asked us to interfere" - and changing mode does not
+             * repeal that. So this refuses the burst and says why, which costs
+             * one cycle and leaves the radio exactly as the operator left it.
+             *
+             * ⚠ -1 is "not answered yet" and must NOT refuse: grounding the
+             * beacon because the radio was slow to reply would be a worse fault
+             * than the one being prevented. */
+            if (cat_get_split_state() == 1 && !cat_cw_tx_offset_engaged()) {
+                ESP_LOGE(TAG, "TX skipped: the radio is in SPLIT, so a burst would go "
+                              "out on VFO B and every spot would name the wrong "
+                              "frequency. Clear split on the radio (VFO A only) - "
+                              "the Tab5 cannot do it over CAT.");
+                set_status("TX held - radio is in SPLIT, clear VFO B");
+            } else if (!ws.my_callsign[0] || !ws.my_grid[0]) {
                 ESP_LOGW(TAG, "TX skipped: callsign/grid not set");
+            /* ⭐ A NEW TONE FOR EVERY BURST - see WSPR_TX_RANDOM_SPAN_HZ. This
+             * passed WSPR_TX_DEFAULT_FREQ_HZ unconditionally, so every unit
+             * running this firmware beaconed on the same 6 Hz of a 200 Hz
+             * sub-band and collided with itself worldwide. */
             } else if (!wspr_tx_build_request(ws.my_callsign, ws.my_grid,
-                                              ws.wspr_tx_dbm, WSPR_TX_DEFAULT_FREQ_HZ,
+                                              ws.wspr_tx_dbm, wspr_tx_pick_tone_hz(),
                                               &req, err, sizeof(err))) {
                 ESP_LOGW(TAG, "TX skipped: %s", err);
             } else if (!wspr_tx_arm(&req, err, sizeof(err))) {
                 ESP_LOGW(TAG, "TX arm refused: %s", err);
             } else {
-                ESP_LOGW(TAG, "TX armed for THIS cycle: %s %s %d dBm (duty %u%%)",
+                ESP_LOGW(TAG, "TX armed for THIS cycle: %s %s %d dBm "
+                              "(group %u tx + %u rx = %u min)",
                          ws.my_callsign, ws.my_grid, ws.wspr_tx_dbm,
-                         (unsigned)ws.wspr_duty_pct);
+                         (unsigned)sched_tx, (unsigned)sched_rx,
+                         (unsigned)((sched_tx + sched_rx) * 2u));
             }
             /* Cleared however this turned out. A build failure or a missing
              * callsign is a configuration problem that will not fix itself,
@@ -2518,6 +2713,20 @@ bool wspr_rx_start(void)
     s_run = true;
     ui_mode_set(UI_MODE_WSPR);
 
+    /* ⭐ WSPR NOW OWNS Max. PA voltage - so apply the declared power HERE,
+     * unconditionally, rather than relying on something else having done it.
+     *
+     * Needed because wspr_pa_apply_declared_dbm() refuses to write while WSPR
+     * is not running (see its own header - a drawer refresh was cutting FT8's
+     * power to WSPR's level). With that gate in place, the only other path
+     * that applied it was wspr_screen_view.c's dial push, which is ONE SHOT
+     * and only fires when the frequency actually has to change - so entering
+     * WSPR already on the right frequency would have left the radio at
+     * whatever the general Output power slider last set, for a ~110 s
+     * key-down. That is the dangerous direction: the whole point of declaring
+     * a low power is that the finals see it. */
+    wspr_pa_apply_declared_dbm(settings_get_wspr_tx_dbm());
+
     /* 32 KB and in PSRAM: wspr_decode_candidate() alone reserves a flat 16 KB
      * frame in its prologue, the self-test measured ~27.5 KB of high-water, and
      * xTaskCreate() would take that from the ~40 KB of free INTERNAL RAM. This
@@ -2833,6 +3042,43 @@ static bool s_pa_cal_status_ok  = false;
 
 void wspr_pa_apply_declared_dbm(int8_t dbm)
 {
+    /* ⛔ WSPR MAY ONLY WRITE Max. PA VOLTAGE WHILE IT ACTUALLY OWNS THE RADIO.
+     *
+     * Operator, 2026-09-17: mid-FT8 at full power, opening the settings drawer
+     * to reach SelfSpotter dropped the radio to WSPR's declared level (2.3 V =
+     * 200 mW) and LEFT it there after closing SelfSpotter and returning to the
+     * FT8 page. The capture shows it exactly:
+     *
+     *     declared-power calibration: 20M: Max. PA voltage set to 2.3V ...
+     *     ui: Settings drawer open
+     *     cat: PA voltage -> 2.3 V (ok)
+     *
+     * wspr_dbm_area_refresh() ends by calling this on EVERY drawer open, to
+     * keep its own hint label truthful - and the hint was costing the operator
+     * 12 dB of transmit power on a completely different mode. On one of the
+     * opens in that same capture the general Output power area's own write
+     * landed last instead ("PA voltage -> 12.0 V"), so which power you
+     * transmitted at came down to the order two drawer sections happened to
+     * refresh in.
+     *
+     * This is the mirror of the gate output_power_area_refresh() already has
+     * (`!wspr_rx_running()` before ITS write, added 2026-09-16 for the same
+     * collision seen from the other side). One of the two has to yield while
+     * the other owns the register, and the rule is: whoever is actually
+     * running the radio right now wins. A REFRESH must never change what the
+     * radio transmits at.
+     *
+     * Not a refusal: the dBm is still stored, still shown, and wspr_rx_start()
+     * applies it the moment WSPR takes the radio - which is also why the
+     * status text below says "when WSPR starts" rather than reporting failure.
+     */
+    if (!s_run) {
+        snprintf(s_pa_cal_status, sizeof(s_pa_cal_status),
+                 "%d dBm - applied when WSPR starts", dbm);
+        s_pa_cal_status_ok = true;
+        return;
+    }
+
     if (settings_get_wspr_pa_saved_x10() != 0) {
         /* The guard is CURRENTLY holding the radio down for WSPR's long
          * key-down - writing a calibrated-for-full-power voltage over that
@@ -2842,16 +3088,58 @@ void wspr_pa_apply_declared_dbm(int8_t dbm)
         snprintf(s_pa_cal_status, sizeof(s_pa_cal_status),
                  "PA guard is protecting the radio - power not adjusted");
         s_pa_cal_status_ok = false;
+        ESP_LOGW(TAG, "declared power NOT applied: the PA guard still holds %u.%u V "
+                      "- transmitting at whatever that is, not at %d dBm",
+                 (unsigned)(settings_get_wspr_pa_saved_x10() / 10),
+                 (unsigned)(settings_get_wspr_pa_saved_x10() % 10), dbm);
         return;
     }
 
-    const char *band = adif_log_band_for_freq(cat_get_frequency());
+    /* ⛔ THE BAND WSPR IS GOING TO, NOT THE ONE THE RADIO IS LEAVING.
+     *
+     * This asked cat_get_frequency() - where the radio is RIGHT NOW - and on
+     * entry from FT8 that is still FT8's frequency, because wspr_rx_start()
+     * applies the declared power before it has pushed its own dial. Operator,
+     * 2026-09-19, entering WSPR from FT8 on 7.074: "Entering WSPR PA still say
+     * 12.0 V". The log line this release added says it outright:
+     *
+     *     declared power NOT applied: not calibrated for 40M
+     *                                 (freq 7074000 Hz, 30 dBm)
+     *
+     * 40 m was never calibrated, so the refusal was CORRECT - about a band WSPR
+     * was about to leave. A moment later it retuned to 14.095600 and sat there
+     * at 12.0 V, because the apply had already had its turn.
+     *
+     * ⚠ Three fixes before this one all addressed WHEN the apply runs (boot,
+     * TX-enable, whether it logs). The fault was WHAT IT ASKED ABOUT. Getting
+     * the timing right cannot help a question aimed at the wrong band.
+     *
+     * WSPR's declared power belongs to WSPR's own dial, which is a stored
+     * setting and is known before CAT says anything - so this is also immune to
+     * the boot ordering that started the whole chain. cat_get_frequency() stays
+     * as the fallback for the case where no WSPR dial has been chosen yet. */
+    uint32_t band_hz = settings_get_wspr_dial_hz();
+    if (!band_hz) band_hz = cat_get_frequency();
+    const char *band = adif_log_band_for_freq(band_hz);
     uint16_t v_x10, w_x100;
     if (!band || !band[0] || !power_cal_voltage_for_dbm(band, dbm, &v_x10, &w_x100)) {
         snprintf(s_pa_cal_status, sizeof(s_pa_cal_status),
                  "not calibrated for %s - Max. PA voltage unchanged",
                  (band && band[0]) ? band : "this band");
         s_pa_cal_status_ok = false;
+        /* ⛔ LOUD, because this is the dangerous silence. Both of this
+         * function's refusals used to write a status string and nothing else -
+         * a string only the drawer shows, and only if someone opens it. The
+         * capture of 2026-09-19 has NO line at all between "slot loop up" and a
+         * burst going out at 12.0 V while declaring 30 dBm: the apply ran,
+         * refused, and left no trace. A safety-relevant write that declines
+         * must say so where the log will keep it.
+         *
+         * ⚠ band is NULL when CAT has not answered yet, which is exactly the
+         * boot case - see the retry in wspr_rx_start(). */
+        ESP_LOGW(TAG, "declared power NOT applied: %s (freq %lu Hz, %d dBm) - "
+                      "the radio stays at whatever Max. PA voltage it already had",
+                 s_pa_cal_status, (unsigned long)band_hz, dbm);
         return;
     }
 

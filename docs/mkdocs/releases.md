@@ -4,6 +4,98 @@ All releases are available on [GitHub Releases](https://github.com/SteffenLav/qm
 
 ## Latest Release
 
+**v1.15.1** — 2026-09-19
+
+**More working memory for WSPR, one file for the diagnostic download, and the same column order on every list.**
+
+- **WSPR has more room to work in.** The routine that picks out signals needs a large block of memory, and on a busy page it could be left with only just enough. When it came up short it simply reported nothing found for that cycle — so a cycle could come back empty with traces plainly visible on the waterfall, most often after moving between pages. Freeing 2.8 MB removes the squeeze, and if it is ever short again it now says so instead of going quiet.
+- **The diagnostic download is a single zip file.** Both logs now arrive as one `qmx-diag-….zip` you can attach to an email, instead of two separate downloads your browser had to be persuaded to accept. It also fetches them one at a time: downloading the live log clears it from the Tab5, so a transfer that failed used to take the log with it. *(John W5JSS.)*
+- **One column order on every list.** FT8, the SelfSpotter list and WSPR now read left to right the same way, with capitalised headings, so your eye lands in the same place on each screen. The SelfSpotter list gains a **GRID** column — the locator the receiving station actually sent.
+- **Calibrate Power warns if your radio is turned down.** It never sweeps past the Max PA voltage your radio is holding, which is right — but if a WSPR session left that at 6 V, the calibration measured only as far as 6 V and then held you there. It now says *"Radio max is only 6.0V — raise it first!"* in amber before you start. *(Rick W5NR.)*
+- **WSPR will not beacon on a band you have not calibrated.** The power figure travels inside the transmitted message and is published worldwide, so a burst on an uncalibrated band would tell everyone a number the Tab5 cannot stand behind. Switching transmit on now says which band needs calibrating instead of starting a countdown.
+- **The WSPR panel has room to breathe.** The stations-per-cycle strip is gone — the list already tells you the same thing — and the transmit-tone line explains itself in two lines rather than shorthand.
+- **Spur removal stays on the panadapter.** It works by shifting your dial 25 Hz and putting it back, and if you changed page or band mid-measurement it could put the *old* frequency back. It now runs only where it is useful, and never writes a frequency it has not re-checked.
+- **The recovery flasher no longer erases before it checks.** If you ever need `flash-recovery`, it now confirms every file is present before touching the chip. It previously erased first and could then fail, taking your settings and LoTW certificate with it.
+
+!!! info "Over the air, from v1.15.0"
+
+    If you are on **v1.15.0**, this updates normally over WiFi. If you are still
+    on **v1.14.x or earlier**, you need the one-time USB-C flasher first — see
+    the v1.15.0 notes below. Pressing update on an older build will fail
+    harmlessly; on v1.14.0–v1.14.3 the message will not be helpful, because
+    those builds predate the size check.
+
+**v1.15.0** — 2026-09-18
+
+!!! warning "This release needs a USB-C cable, once"
+
+    **v1.15.0 rewrites the partition table**, and an over-the-air update cannot
+    do that — it can only ever write the app, never the map of the flash. That
+    limit is deliberate: it is what stops a failed download taking the layout
+    with it.
+
+    So v1.15.0 arrives as a **flasher download**, over the same USB-C data cable
+    and the same script you used to install the firmware the first time. It is
+    the only release that needs it, and everything after it is over the air again
+    — with more than twice the room.
+
+    **There is no over-the-air image attached to this release, on purpose.** If
+    you tap the update notice it will say the download could not be reached. That
+    is the release refusing to be installed the wrong way, not a fault.
+
+    **Your settings, memory channels, QSO log and LoTW certificate are kept.**
+    Press **Enter** at the flash-type prompt — never **E**, which erases the whole
+    chip including your LoTW private key. **New users are unaffected**: a first
+    install already uses the flasher.
+
+**The band-plan slider is a window you drag, the settings backup was missing thirty-one settings, and WSPR will not beacon in split.**
+
+- **What the cable buys.** The firmware had **47 KB** left in its 4 MB slot — about one feature from refusing to build. Dropping a third, never-used copy of the firmware leaves two slots of 6.81 MB with **2.87 MB free**. Over-the-air updates work exactly as before afterwards, alternating between the two.
+- **The band-plan slider moves the window, not a dial.** Grab the framed block and the whole picture travels with it — block, frequency marker and filter passband together — and it stays where you let go, with the radio following. It used to write a frequency and let the display decide where to land, so the box sprang back the moment you lifted your finger. The grab area is about **8 mm** tall now rather than 4, because the strip alone was never a finger, and the passband fades back twice as fast on release.
+- **Your Config download was missing 31 settings, including the power calibration** *(found from a question by Bruce N9JCV)*. That calibration is an hour at a dummy load per band and was the one thing in the file nobody could recreate from memory — it had never been included. Also added: the per-band power target, the WSPR schedule and band hopping, Field Day class and section, the activation reference, the FT8 transmit tone and twenty more. Two of them were worse than missing — the file would *accept* the transmit tone and its hold but never wrote them, so saving and restoring quietly reverted both.
+- **Three settings reached the web page** that had been Tab5-only: waterfall speed, WSPR band hopping, and whether your QMX has GPS. The last is not cosmetic — claiming it stops the Tab5 keeping the radio's clock.
+- **WSPR will not beacon while the radio is in split** *(John W5JSS)*. In split the radio transmits on VFO B while still reporting VFO A, so every spot you publish names a frequency your signal was never on. The Tab5 asks the radio before each transmission and holds the burst, saying so on screen. It will not clear the split for you — that is your setting, and on the QMX it cannot be cleared over the cable anyway.
+- **The WSPR transmit block was unreadable** *(John W5JSS)*: red text on an orange background, a contrast ratio of 1.15 to 1. Black on orange now. The same block sometimes kept the orange of a finished transmission while merely counting down.
+- **The on-screen keyboard came back on a second tap** *(Samuel W7STF)*. Tapping a field that was already selected did nothing — nine fields across seven windows.
+- **A missing SD card says so**: the indicator is crossed out in grey, and tapping it explains what a card is for. A tap anywhere on the bottom bar used to open the updater.
+- **The WSPR transmit schedule is two plain counts** — transmit cycles and receive cycles in a repeating group — with the result written out in words as you change it. "1 in 5" meant different things to different people.
+
+## Previous Releases
+
+**v1.14.4** — 2026-09-18
+
+**The reboots are fixed, countries are spelled out, and 79 callsign prefixes named the wrong country.**
+
+- **The reboots.** Fifteen bench runs before the fix lasted a median of **15 minutes**; with it the same bench ran **14.7 hours** with none. Three rarely-read arrays sat in the small internal RAM that USB, WiFi and the SD card all need — moving them freed 17 KB. One exhaustion, arriving wherever the next allocation happened to be.
+- **Opening the settings drawer cut your transmit power** to WSPR's declared level and left it there.
+- **Countries spelled out** on the FT8 and WSPR lists, **79 prefixes** corrected (Taiwan as China, Ukraine as Russia, sixteen UK prefixes as England), and stations with no grid now show an approximate distance.
+- **WSPR bursts per transmission** *(John W5JSS)*, **Antenna Tune shows SWR, watts and seconds left** *(Randy N4OPI)*, **Calibrate Power stops at your own Max PA voltage** *(Bruce N9JCV)*, and **a Flush button in the SelfSpotter header** *(Uwe DL8UG)*.
+
+## Previous Releases
+
+**v1.14.3** — 2026-09-17
+
+**Fixed a v1.14.2 crash: picking a new TX tone from the web UI while a QSO or CQ run was armed could reboot the Tab5.**
+
+- **Reproduced 100% on two benches** *(Randy N4OPI)* - it never happened while actually transmitting, only while armed and waiting. Same underlying bug as the v1.14.0 crash - a whole settings structure copied onto a task's stack just to read one value - reached this time from the web server's own task instead of the display or CAT tasks. Fixed the same way: read one setting at a time. Reproduced and confirmed fixed on the bench before release.
+- **The TX Hold checkbox not applying**, reported in the same message, was very likely the same crash: tone and hold travel in one web request, and the device rebooted while handling the tone half, before hold was ever reached. Confirmed applying and reading back correctly now.
+- **Output power stuck at WSPR's level after a reboot.** Max. PA voltage lives in the radio and a Tab5 restart does not reset it - so if WSPR had turned it down for its declared power (as low as 2.3 V, about 200 mW) and the Tab5 was then restarted straight into FT8, everything went out at that level while the Output power slider showed the figure it was *meant* to be at. Handing the power back only ever happened when you left the WSPR page live, and a reboot has no such moment. The radio is now told the correct level again whenever the CAT link comes up.
+
+## Previous Releases
+
+**v1.14.2** — 2026-09-17
+
+**General sluggishness since v1.13.0, root-caused — plus a web UI hang, an output-power surprise after calibration, and a SelfSpotter map bug.**
+
+- **Sluggishness some users saw starting with v1.13.0** *(Randy N4OPI)*, including with the SelfSpotter map screen closed, root-caused: SelfSpotter's PSK Reporter feed connects over its own background task from boot regardless of whether the map is ever opened, and that task was running at a higher scheduling priority than the display, with no core assigned to it — so it could hold the display up on every incoming report. It now runs at a lower priority, pinned to the second core. Not yet confirmed fixed on Randy's own hardware.
+- **The web UI's "find open slot" tool could hang on "Applying..." and lose contact with the QMX**, needing a power cycle, only mid-QSO or CQ run *(Randy N4OPI)*: a frequency-mode command could collide with an in-progress FT8/WSPR transmit burst on the radio's own control link. It now waits its turn. The page's warning text was also backwards (said it would be refused while transmitting; it actually applies automatically once the burst ends) and Apply now gives up cleanly after 8 seconds if this ever recurs.
+- **Output power reading near-zero right after Calibrate Power finishes** *(Gyula HA3HZ)* — a slider defaulted to its lowest setting and wrote that to the radio unconditionally. It now reads the radio's actual level when nothing has been chosen yet.
+- **SelfSpotter**: countries like Italy, Denmark and Greece drew as boxes on the map, from a coastline-simplification bug — fixed. Zoom raised 10x → 50x. The settings drawer's own content was taller than the panel and silently hid the Flush button — fixed. A screenshot of the map now carries your callsign, dial frequency and UTC time in its own header line *(Gyula HA3HZ)*, and every screenshot download gets a timestamped filename.
+- **Colour cleanup**: the map, the Live Spots lane and the network drawer's spot checkboxes now share one colour scheme instead of three that had drifted apart.
+- **Waterfall scroll speed** is now a real setting (1x–4x) instead of a fixed rate.
+
+## Previous Releases
+
 **v1.14.1** — 2026-09-16
 
 **A fix for a v1.14.0 crash on tuning or QMX power-on.**
@@ -723,7 +815,7 @@ See [Full Version History](https://github.com/SteffenLav/qmx-panadapter/blob/mai
 
 - **Source code:** [GitHub Repository](https://github.com/SteffenLav/qmx-panadapter)
 - **Releases:** [GitHub Releases](https://github.com/SteffenLav/qmx-panadapter/releases)
-- **User Guide:** [PDF](QMX-Panadapter-UserGuide-v1.14.1.pdf) or [Web](quick-start.md)
+- **User Guide:** [PDF](QMX-Panadapter-UserGuide-v1.15.1.pdf) or [Web](quick-start.md)
 - **Build Guide:** [Build from Source](build/build.md)
 - **Technical Details:** [CLAUDE.md](https://github.com/SteffenLav/qmx-panadapter/blob/main/CLAUDE.md)
 

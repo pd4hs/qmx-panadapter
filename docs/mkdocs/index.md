@@ -43,8 +43,8 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
 - **WSPR** — a third page, reached by the same swipe. A propagation beacon rather than a
   contact mode: a very slow, very weak signal carrying your callsign, grid and power,
   which stations worldwide report hearing. What was heard each two-minute cycle with band,
-  distance and bearing, the furthest of the session, and a per-cycle history. Receiving is
-  the default; transmitting is opt-in, with a duty cycle and optional band hopping.
+  distance and bearing, and the furthest of the session. Receiving is
+  the default; transmitting is opt-in, with a transmit schedule and optional band hopping.
   **Calibrate Power** measures real RF output per band on a dummy load, so **Declared
   power** only offers standard dBm steps the radio actually reaches — labelled with the
   real wattage, not a textbook figure — which is also how you protect the finals for a
@@ -74,9 +74,11 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
   band presets, live TX status with a **Call CQ** button, a sortable QSO log you can
   correct entries in, config download and upload, a microSD file browser, screenshots,
   and the diagnostic log.
-- **Updating from the device** *(needs WiFi)* — a new release is fetched quietly in the
-  background and offered once, with **Restart now** or **Later**. Nothing is installed
-  without you asking, and the automatic download can be switched off.
+- **Updating from the device** *(needs WiFi)* — tap the version line, press **Download
+  now**, then **Restart now**. Nothing is fetched or installed until you ask.
+  ⚠ **Coming from v1.14.x or earlier? v1.15.0 needed a one-time USB-C cable
+  update** — do that first and everything after it is over the air. See
+  [Settings](guide/settings.md#firmware-updates).
 - **Built-in manual** — this whole guide is compiled into the firmware, so it is instant
   and needs no WiFi and no card. It opens at the chapter for the screen you are on,
   warning banners are tappable, and a **Need guidance?** panel takes your symptom in plain
@@ -85,7 +87,7 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
   power-off, the QMX's clock as an offline fallback, automatic GPS phase-lock if your QMX
   has one, a manual set-and-sync panel, and FT8 timing that self-corrects from the decoded
   band consensus.
-- **microSD backup** — insert a card *before switching on* and your ADIF log, full config,
+- **microSD backup** — insert a card (restart afterwards) and your ADIF log, full config,
   LoTW certificate and key, and diagnostic log are mirrored automatically. Continuous with
   WiFi off (green SD dot); one complete backup per start-up with WiFi on (yellow dot).
 - **Diagnostics** — an always-on log with nothing to enable: 5 MB in RAM, a rolling copy
@@ -109,16 +111,31 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
 
 ## Status
 
-**v1.14.1 — a complete, self-contained FT8/FT4 station with no PC in the loop, a second
+**v1.15.1 — a complete, self-contained FT8/FT4 station with no PC in the loop, a second
 operating position in any browser, a WSPR propagation beacon, and the radio's own menus
 on the screen.** The panadapter, FT8/FT4 receive and transmit, WSPR, ADIF logging and all
 four logbook uploads — QRZ, eQSL, ARRL LoTW and your own Cloudlog or Wavelog — are stable
 and in daily use.
 
-**v1.14.1 — a fix for a v1.14.0 crash on tuning or QMX power-on.** A settings copy too
+!!! warning "Coming from v1.14.x or earlier? One USB-C cable update first"
+
+    **v1.15.0** reclaimed 2.81 MB of unused flash, which meant rewriting the
+    partition table — something an over-the-air update cannot do. If you are
+    still on v1.14.x or earlier you need that one **flasher download**, over
+    the same USB-C cable you used the first time. **Everything from v1.15.0
+    onwards, including this release, is over the air again** with more than
+    twice the room. **Your settings, QSO log and LoTW certificate are kept** —
+    press **Enter** at the flash-type prompt, never **E**. New users are
+    unaffected, and anyone already on v1.15.0 simply updates from the device.
+
+**v1.15.1 gives WSPR more working memory.** The routine that picks signals out of a cycle needs a large block of it, and on a busy page it could be left with only just enough — so a cycle could come back empty with traces plainly visible on the waterfall, most often after moving between pages. Freeing 2.8 MB removes the squeeze. The **Diagnostic download** is now a single zip file you can attach to an email, and it no longer clears the log when a transfer fails. **FT8, the SelfSpotter list and WSPR share one column order** so the same information sits in the same place on every screen.
+
+**v1.14.4 fixed the reboots.** Fifteen runs on the bench before the fix lasted a median
+of 15 minutes; with it, the same bench ran 14.7 hours with none.
+
+**v1.14.1 fixed a v1.14.0 crash on tuning or QMX power-on.** A settings copy too
 large for a 4096-byte task stack, hit by nearly any frequency change. Thanks to Martin
-Howard and Rick Trommer W5NR for the reports, and Uwe DL8UG for the fix. If you are on
-v1.14.0, update.
+Howard and Rick Trommer W5NR for the reports, and Uwe DL8UG for the fix.
 
 **New in v1.14.0 — Calibrate Power.** Sweeps *Max. PA voltage* through 45 points on a
 dummy load and measures the real RF output at each, per band. **Declared power** (WSPR)
@@ -254,7 +271,7 @@ given a static IP address.
 
 **Stuck, or not sure what something is called?** The Tab5 can help you itself — see [Getting Help](getting-help.md).
 
-**Want the whole guide at once?** Download the [User Guide PDF](QMX-Panadapter-UserGuide-v1.14.1.pdf) — the whole user guide as one printable document.
+**Want the whole guide at once?** Download the [User Guide PDF](QMX-Panadapter-UserGuide-v1.15.1.pdf) — the whole user guide as one printable document.
 
 **Builder?** Head to [Build from Source](build/build.md) for ESP-IDF setup and the complete module map.
 

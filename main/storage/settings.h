@@ -234,6 +234,7 @@ typedef struct {
     float    wf_contrast_db;  // waterfall contrast: dB span filling the colour ramp (default 45)
     uint8_t  wf_floor_blend;  // waterfall per-bin floor blend 0..100% (0=global, default 100)
     uint8_t  wf_window;       // FFT window: 0=Blackman-Harris 1=Hann 2=Nuttall (default 0)
+    uint8_t  wf_speed_mult;   // waterfall scroll speed, 1..4x the normal 10 rows/s (default 1)
     bool     display_flip;    // landscape flipped 180 deg for upside-down mounting (default false)
     // QMX AF gain in DECIBELS - the same number the radio shows on its own LCD
     // (see cat.h's CAT_AF_GAIN_MAX comment). Stored only as a fallback slider
@@ -379,8 +380,46 @@ typedef struct {
      * 0.2 W whatever the operator was actually running. */
     uint32_t wspr_dial_hz;    // standard WSPR dial for the chosen band (default 20 m)
     bool     wspr_tx_en;      // WSPR transmit enabled at all (default OFF)
-    uint8_t  wspr_duty_pct;   // fraction of cycles to transmit: 0/10/20/33/50
+    /* ⛔ THE SCHEDULE IS SPELLED OUT, NOT NAMED. Two counts describing one
+     * repeating group: transmit this many cycles back to back, then receive
+     * this many, for ever.
+     *
+     *     wspr_tx_cycles = 2, wspr_rx_cycles = 8
+     *     -> Tx Tx Rx Rx Rx Rx Rx Rx Tx Tx Rx Rx ...   period 10 cycles = 20 min
+     *
+     * It replaced a "1 in N" dropdown plus a separate "bursts per
+     * transmission", and the reason is that the pair had no agreed meaning.
+     * "1 in 5" plainly means one cycle in five - and with a single burst that
+     * is exactly what the code did. Ask for TWO bursts and the phrase stops
+     * saying anything: does the group grow into the listening time (period
+     * stays 5) or is the listening time preserved (period becomes 6)? The code
+     * did the second, and I told John W5JSS on 2026-09-18 that it did the
+     * first. Neither of us was misreading the other; the label could not settle
+     * it. Operator: "why dont we just skip the '1 in X' change it all to:
+     * number of TX's + number of RX's in a forever repeating group".
+     *
+     * The period is now simply wspr_tx_cycles + wspr_rx_cycles, which is the
+     * whole point: nothing has to be inferred.
+     *
+     * ⚠ MIGRATION IS EXACT, not approximate. The old period was
+     * duty + bursts - 1, so rx = duty - 1 and tx = bursts reproduce it
+     * cycle-for-cycle - no unit changes behaviour on upgrade. Guarded by
+     * KEY_WSPR_SCHED_V so a stored 5 is never reinterpreted as 5 receive
+     * cycles; this field's meaning has already changed once (percentage ->
+     * period, 2026-09-12) and that migration is the precedent.
+     *
+     * wspr_tx_cycles == 0 means RECEIVE ONLY - it is how transmitting is turned
+     * off from this control, replacing the old dropdown's "Receive only" row.
+     * wspr_rx_cycles is never 0: that would key the radio continuously and the
+     * page would never receive, which was measured on the bench and is recorded
+     * in CLAUDE.md under the bursts-per-transmission note. */
+    uint8_t  wspr_rx_cycles;  // receive cycles after each group, 1-20
+    uint8_t  wspr_tx_cycles;  // consecutive transmit cycles per group, 0-4 (0 = RX only)
     int8_t   wspr_tx_dbm;     // declared TX power, dBm (default 23 = 200 mW)
+    /* Pinned WSPR transmit tone in Hz, or 0 for a fresh random one per burst
+     * (the default, and the standalone-beacon convention - see
+     * WSPR_TX_RANDOM_SPAN_HZ). Set by tapping the WSPR waterfall. */
+    uint16_t wspr_tx_tone_hz;
     pwr_cal_table_t pwr_cal;  // measured PA-voltage -> watts, per band (see the type's own comment)
     pwr_target_table_t pwr_target;  // operator's own target output power, per band (see the type's own comment)
     /* Captured windows still to be written to the SD card as WAV.
@@ -568,9 +607,11 @@ void settings_set_cq_sel(uint8_t idx);
 // Don WB0LQW: "I usually send CQ 2-4 times and then pause". Set from the CQ
 // preset modal's top-right cycle button; consumed by ft8_qso.c's CQ loop.
 void settings_set_cq_max_calls(uint8_t n);
+uint8_t settings_get_cq_max_calls(void);    // narrow: rearm_current() runs on whatever task re-armed (#409)
 void settings_set_hound_mode(uint8_t m);    // 0 off, 1 guided, 2 automatic
 /* Spend one slot listening after every N CQ calls. 0 = never. */
 void settings_set_cq_listen_every(uint8_t n);
+uint8_t settings_get_cq_listen_every(void); // narrow, same reason (#409)
 
 
 // First-boot onboarding done: once true, the WiFi/identity prompts are never
@@ -593,6 +634,7 @@ void settings_set_wf_black_db(float db);
 void settings_set_wf_contrast_db(float db);
 void settings_set_wf_floor_blend(uint8_t pct);
 void settings_set_wf_window(uint8_t idx);
+void settings_set_wf_speed_mult(uint8_t mult);
 
 // Display 180-degree flip for upside-down mounting (debounced flush).
 void settings_set_display_flip(bool v);
@@ -608,7 +650,8 @@ int16_t settings_get_cw_tx_offset_hz(void);
 /* Narrow reads for the WSPR transmit schedule - see the note in settings.c.
  * Never load the whole struct on taskLVGL or httpd just to get these two. */
 bool    settings_get_wspr_tx_en(void);
-uint8_t settings_get_wspr_duty_pct(void);
+uint8_t settings_get_wspr_rx_cycles(void);
+uint8_t settings_get_wspr_tx_cycles(void);
 uint16_t settings_get_wspr_pa_saved_x10(void); // outstanding PA-guard restore, 0 = none
 /* Static-IP fields ONLY, 64 bytes of caller-supplied buffers. Any argument may
  * be NULL. Empty ip means DHCP.
@@ -681,6 +724,8 @@ bool settings_get_spotmap_en(void);     // narrow: callers are on small stacks
 void settings_set_sota_en(bool v);   // SOTA activations via spothole.app (opt-in)
 bool settings_get_sota_en(void);        // narrow, same reason as settings_get_spots_en
 void settings_set_ota_autodl(bool v); // #239: download a new release quietly (never applies it)
+bool settings_get_sim_mode_en(void);    // narrow: ft8_tx_arm()'s Digi pre-flight runs on WHATEVER
+                                         // task armed it - the httpd worker among them (#409)
 void settings_set_drawer_expert(bool v); // remember Basic vs Expert across a reboot
 
 // ---- Known WiFi networks --------------------------------------------------
@@ -754,8 +799,17 @@ void settings_set_fd_section(const char *section);
 void settings_set_sim_mode_en(bool v);
 void settings_set_wspr_dial_hz(uint32_t v);
 void settings_set_wspr_tx_en(bool v);
-void settings_set_wspr_duty_pct(uint8_t v);
+void settings_set_wspr_rx_cycles(uint8_t v);   // clamped 1-20
+void settings_set_wspr_tx_cycles(uint8_t v);   // clamped 0-4, 0 = receive only
 void settings_set_wspr_tx_dbm(int8_t v);
+int8_t settings_get_wspr_tx_dbm(void);  // narrow: applied at wspr_rx_start()
+/* WSPR's OWN dial, which is what its declared power is calibrated against - not
+ * wherever the radio happens to be when WSPR is entered. See the long note at
+ * wspr_pa_apply_declared_dbm(). */
+uint32_t settings_get_wspr_dial_hz(void);
+/* 0 = pick a new random tone every burst; otherwise the pinned tone in Hz. */
+uint16_t settings_get_wspr_tx_tone_hz(void);
+void     settings_set_wspr_tx_tone_hz(uint16_t hz);
 // Power calibration table, one band's row at a time (main/ui/power_cal_modal.c).
 // Never the whole blob: both copy exactly one pwr_cal_band_t (28 bytes), so a
 // caller has no reason to reach for settings_load_all() just for this.

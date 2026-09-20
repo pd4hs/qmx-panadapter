@@ -240,6 +240,10 @@ to restart.
 - **Hann** — smoother peaks
 - **Nuttall** — sharpest edges
 
+**Waterfall scroll speed** — 1× to 4× (default 1×). How many rows the waterfall
+advances per render, independent of the spectrum and S-meter update rate, which
+stay unchanged either way.
+
 **Spur suppression — withdrawn in v1.8.9.** The control is no longer in the
 drawer.
 
@@ -382,18 +386,37 @@ a large part of the display, and with a real keyboard you get that space back.
 
 ## Firmware updates
 
-**Download updates automatically** *(Network — on by default, v1.9.3)* — when a
-newer release appears, the Tab5 fetches it quietly in the background so that
-the only thing left for you is one decision: restart now, or later. The
-spectrum, waterfall and FT8 decoding keep running while it downloads.
+!!! warning "The next update after v1.14.4 needs a USB-C cable, once"
 
-Switch it off if you are on a metered connection — a phone hotspot in a field,
-for example — as each update is about 3.3 MB. With it off nothing is fetched
-until you ask: the bottom bar still offers the update, and the window's button
-reads **Download now**.
+    v1.14.4 is the last release that installs over the air for a while. The one
+    after it claims 2.81 MB of flash that no partition has ever used, which
+    means rewriting the partition table — and an over-the-air update can only
+    ever write the app, never the map of the flash. That is deliberate: it is
+    what stops a failed download taking the layout with it.
 
-⚠ Turning this on never installs anything by itself. Applying an update
-restarts the Tab5, and only you can ask for that — see
+    So the next firmware arrives as a **flasher download** — the same USB-C data
+    cable and the same `flash.bat` / `flash.command` you used the first time.
+    One time, and everything after it is over the air again.
+
+    **Your settings and your log are kept.** Press **Enter** at the flash-type
+    prompt. Do *not* press **E** — that erases the whole chip, including your
+    QSO log and your LoTW private key, and it is not needed here.
+
+    The Tab5 will tell you when the time comes: the update window says so
+    instead of offering a download, and it refuses to fetch an image it cannot
+    install.
+
+**Updating is one route, and you are always asked** *(v1.14.4)* — when a newer
+release appears, the version at the bottom of the screen changes to show it.
+Tap it, and a window opens with **Download now**. The download runs in the
+background, and when it finishes the same window offers **Restart now**.
+
+Nothing is fetched and nothing is installed until you press something. The
+earlier "download updates in the background" option is gone: it had been
+suppressed by a memory guard for months and never actually ran, so removing it
+made the behaviour match what it had always been in practice.
+
+⚠ Applying an update
 [Keeping It Up To Date](../quick-start.md#step-10-keeping-it-up-to-date).
 
 ---
@@ -468,7 +491,7 @@ It does nothing at all until both your **callsign and grid** are set, and it is 
 ## WSPR
 
 The **WSPR** group appears only while the WSPR page is up, and holds **Allow
-transmitting**, **Declared power**, **Duty cycle**, **Band hopping** and **Publish spots
+transmitting**, **Declared power**, **Transmit schedule**, **Band hopping** and **Publish spots
 to wsprnet**. They are described where they make sense — see [WSPR](wspr.md).
 
 ## The snap-on keyboard
@@ -535,7 +558,7 @@ Useful for troubleshooting rare issues.
 
 ## microSD Auto-Archive — Station Backup
 
-Insert a microSD card (FAT32 or exFAT, any size — a plain 32 GB FAT32 card is ideal) **before switching the Tab5 on** and it automatically mirrors your whole station to `/qmx-panadapter/` on the card. It's a **grab-and-go backup**: pull the card into a PC (or another Tab5) to back up or move your setup — no computer needed in the field.
+Insert a microSD card (FAT32 or exFAT, any size — a plain 32 GB FAT32 card is ideal) and it automatically mirrors your whole station to `/qmx-panadapter/` on the card. It's a **grab-and-go backup**: pull the card into a PC (or another Tab5) to back up or move your setup — no computer needed in the field.
 
 | File | Contents |
 |------|----------|
@@ -546,7 +569,20 @@ Insert a microSD card (FAT32 or exFAT, any size — a plain 32 GB FAT32 card is 
 | `qmx-log.txt` (+`.1`) | Diagnostic log, rolling (rotated at 5 MB) |
 | `README.txt` | A plain-text description of every file, written on each mount |
 
-**Insert the card before switching the Tab5 on.** A card pushed in later is not picked up until the next start-up — the Tab5 can only claim the card during a short window early in boot.
+**After inserting the SD card your Tab5 needs a restart.** The Tab5 can only claim the card during a short window early in boot, so a card pushed in while it is running is not used until you restart.
+
+### Benefits of a microSD card
+
+The Tab5 works perfectly well without one. With a card in, you also get:
+
+- **A full diagnostic history instead of the last few minutes.** Without a card, the log that survives a restart is held in a small area of internal flash and is overwritten roughly every 11 minutes of busy operating. On the card it is kept whole — so if something goes wrong overnight, or an hour ago, the evidence is still there when you come to report it.
+- **A grab-and-go station backup.** Your QSO log, every setting, your WiFi details and your LoTW certificate and key, mirrored automatically. Move the card to another Tab5 and your station comes with it, with no computer involved.
+- **A safety net for the QSO log.** The copy from just before the log last got *smaller* is kept beside it as `qso.prev.adi`, so a deletion you only notice two restarts later is still recoverable.
+- **Somewhere to put things.** Browse, download, upload and delete everything on the card from any computer at `http://qmx.local/files` — without pulling it out.
+
+A plain 32 GB FAT32 card is ideal. There is no benefit to a fast or expensive one: the Tab5 writes a few kilobytes a minute.
+
+**After inserting the SD card your Tab5 needs a restart.**
 
 ### When the mirror runs
 

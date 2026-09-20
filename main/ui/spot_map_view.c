@@ -38,9 +38,11 @@
 #include "net/band_conditions.h"
 #include "util/world_map_data.h"
 #include "util/maidenhead.h"
-#include "util/geo_coords.h"    // geo_coords_iso_for_call() - LIST tab's ISO column
+#include "util/geo_coords.h"    // per-prefix coordinates for placing a station
+#include "util/country.h"       // country_display() - the ONE country-name rule, shared with the FT8/WSPR lists
 #include "util/format_freq.h"
 #include "storage/settings.h"
+#include "cat.h"                // cat_get_frequency() - the header's own info line
 #include "adif/adif_log.h"      // adif_log_band_for_freq() - the ONE band table, see its own comment
 
 #include "esp_log.h"
@@ -100,6 +102,7 @@ static lv_obj_t *s_table_list = NULL;   // Tabelle tab: scrollable row list
 static lv_obj_t *s_grid_warn  = NULL;   // "set my_grid" notice, shown when it's empty
 static lv_obj_t *s_tabview    = NULL;   // so map_pinch_poll_cb() can tell MAP is the visible tab
 static lv_obj_t *s_zoom_dd    = NULL;   // greyed out on LIST/PROP - see tabview_changed_cb
+static lv_obj_t *s_info_lbl   = NULL;   // callsign/date/time/freq - see update_info_line()
 static lv_timer_t *s_refresh_timer = NULL;
 static lv_timer_t *s_pinch_timer   = NULL;
 static bool s_active = false;
@@ -145,14 +148,28 @@ static bool s_view_is_users = false;
 static float s_map_zoom = 1.0f;
 static void map_sync_scroll_chain(void);   // defined with the drag-pan, far below
 static float s_map_pan_dx = 0.0f, s_map_pan_dy = 0.0f;
+/* Screen fraction the current pinch is anchored on - see map_pinch_poll_cb. */
+static float s_map_pinch_fx = 0.5f, s_map_pinch_fy = 0.5f;
+/* Last touch point LVGL reported on the map, in SCREEN coordinates. Written by
+ * map_drag_cb (where an indev is valid) and read by the pinch timer (where one
+ * is not). See the comment at its capture. */
+static lv_point_t s_map_last_pt;
+static bool       s_map_have_last_pt = false;
 #define MAP_ZOOM_MIN 1.0f
-/* ⛔ THE CHALLENGE THE OPERATOR ASKED FOR. This was 8.0 - the new Zoom
- * dropdown's top preset is x10, and a preset the pinch ceiling cannot then
- * reach would be a control that lies about what it just did (pick x10, pinch
- * out one notch, and the picture would already be past the dropdown's own
- * stated maximum). Raised to 10 so pinch and the dropdown share one ceiling -
- * whichever one you used last, the other is never surprised by it. */
-#define MAP_ZOOM_MAX 10.0f
+/* ⛔ THE CHALLENGE THE OPERATOR ASKED FOR, TWICE NOW. This was 8.0, then 10 -
+ * the second time (2026-09-16, right after the coastline decimation fix
+ * below started showing Italy's real boot shape instead of a box): "I would
+ * like to be able to zoom in further by pinching (until it make no sense)".
+ * That is a real ceiling to aim for, not "as far as possible" - the source
+ * data was simplified at generation time to a 0.05 deg Douglas-Peucker
+ * tolerance (tools/gen_world_map.py), so past a certain zoom every remaining
+ * "detail" is just that tolerance's own straight-line segments getting large
+ * enough to see, not real coastline. 50 is comfortably past that (at x50 the
+ * screen covers roughly a European country's width - the segments are still
+ * far smaller than that) while stopping short of zooming into visibly blocky
+ * nothing. Raised again so pinch and the dropdown (below) keep sharing one
+ * ceiling - whichever one you used last, the other is never surprised by it. */
+#define MAP_ZOOM_MAX 50.0f
 
 // Filter: CW (RBN), Digi (PSK Reporter) and WSPR (net/wspr_self.c) are the
 // only three sources there are, so this is three checkboxes, not the eight
@@ -177,6 +194,11 @@ typedef enum { SPOT_SRC_CW, SPOT_SRC_DIGI, SPOT_SRC_WSPR } spot_kind_t;
 
 typedef struct {
     char        call[16];      // who heard us
+    /* The reporter's OWN grid, exactly as they sent it - "" when the source
+     * does not carry one. RBN skimmers never do (a skimmer reports a callsign,
+     * not a location; its position comes from QRZ or a DXCC centroid), so that
+     * column is honestly blank for CW rather than filled from a guess. */
+    char        grid[7];
     char        mode[8];       // "CW" (RBN), "FT8"/"FT4"/... (PSK Reporter), or "WSPR"
     uint32_t    freq_hz;
     int         snr_db;
@@ -199,30 +221,36 @@ static bool passes_filter(const self_spot_t *sp)
     }
 }
 
-// Brighter than ui_theme.h's UI_COLOR_MODE_CW/_DIGI/_WSPR, ON PURPOSE and
-// MAP-ONLY - those match the bandplan strip elsewhere in the UI, and dimming
-// this map's traces to match them was never the point. Traces are drawn at
-// LV_OPA_80 (recent) or LV_OPA_30 (older than 30 min, see map_render_spots())
-// over a now much-discussed land/water fill, and the original hues read as
-// visibly dim once blended at those opacities - operator, 2026-09-13, after
-// the land-colour passes above: "all three colours ... seems to be dim...
-// this will also give a better contrast to the historic traces". Same hues,
-// pushed brighter/more saturated so the source is still identifiable at a
-// glance and the faded (old) traces still read as traces, not noise.
-#define MAP_SRC_COLOR_CW   0x42A5F5   /* was UI_COLOR_MODE_CW   0x2477B3 */
-#define MAP_SRC_COLOR_DIGI 0xFFB300   /* was UI_COLOR_MODE_DIGI 0xB37724 */
-#define MAP_SRC_COLOR_WSPR 0x66BB6A   /* was UI_COLOR_MODE_WSPR 0x3D8C40 */
-
+// ⛔ COLLAPSED BACK INTO ui_theme.h's SHARED PALETTE (operator, 2026-09-16).
+// This used to hand-shift its own brighter CW/Digi/WSPR hues - see git
+// history for the 2026-09-13 reasoning (contrast against the land/water fill
+// at LV_OPA_80/LV_OPA_30) - but a project-wide colour audit turned up FOUR
+// independent palettes all claiming "amber"/"green"/"CW" with different
+// hexes, this one drifting from ui_theme.h's UI_COLOR_MODE_* by nothing but a
+// comment (`/* was ... */`) rather than shared code. Operator's call: one
+// palette, everywhere a MODE is the thing being coloured - if the map's
+// traces read dim again at these hexes, that is a reason to brighten
+// ui_theme.h's palette itself (so the bandplan strip and Memory Channels
+// gain the same fix), not to fork a second copy back into existence here.
+//
 // The sidebar's three source checkboxes ARE this map's legend (add_filter_
-// checkbox() below), so their swatches use these same brighter values, not
-// ui_theme.h's - a legend that shows a different colour than what the map
-// actually draws would be worse than no legend.
+// checkbox() below), so their swatches must stay exactly what the map draws -
+// both now read the shared UI_COLOR_MODE_* constants directly, so they cannot
+// drift from each other again.
+//
+// ⚠ NOT routed through ui_theme_mode_color(mode_string) - that helper
+// substring-matches a free-text mode string and has NO case that returns
+// UI_COLOR_MODE_WSPR at all (checked: only DiGi/FT8/FT4/RTTY, USB, LSB, CW
+// are recognised, so "WSPR" falls through to its UI_COLOR_KEY_BG default).
+// This dispatch is off spot_kind_t, an enum with an unambiguous answer for
+// all three cases, so it reads the constants directly rather than going
+// through string-matching built for a different, noisier input.
 static uint32_t source_color(spot_kind_t src)
 {
     switch (src) {
-    case SPOT_SRC_DIGI: return MAP_SRC_COLOR_DIGI;
-    case SPOT_SRC_WSPR: return MAP_SRC_COLOR_WSPR;
-    default:            return MAP_SRC_COLOR_CW;
+    case SPOT_SRC_DIGI: return UI_COLOR_MODE_DIGI;
+    case SPOT_SRC_WSPR: return UI_COLOR_MODE_WSPR;
+    default:            return UI_COLOR_MODE_CW;
     }
 }
 
@@ -253,6 +281,51 @@ static void format_km_dotted(long km, char *out, size_t out_sz)
         if (o + 1 < out_sz) out[o++] = digits[i];
     }
     out[o] = '\0';
+}
+
+// Gyula HA3HZ, 2026-09-17: "If I don't include the time and location in the
+// screenshot filename, the image itself doesn't convey much information...
+// I would like to see my own callsign, the date, the time, and the
+// frequency displayed in the 'Selfspotter' line of the header." A
+// screenshot is a self-contained record of what it shows, and callsign,
+// UTC and dial frequency are exactly the three facts a bare image cannot
+// otherwise carry - so this reads it back off the same sources the rest
+// of the UI already trusts (settings_get_my_callsign(), time(NULL)/
+// gmtime_r() - the same pair status.c uses for the bottom-bar clock,
+// cat_get_frequency(), and format_freq_hz() - #302's one shared frequency
+// formatter) rather than inventing new ones. Called once at build and
+// every refresh_timer_cb tick (1 Hz) - a single small label's text does
+// not need change-detection to stay cheap.
+static void update_info_line(void)
+{
+    if (!s_info_lbl || !lv_obj_is_valid(s_info_lbl)) return;
+
+    char call[16];
+    settings_get_my_callsign(call, sizeof(call));
+
+    char freq_buf[16];
+    format_freq_hz(cat_get_frequency(), g_freq_style, freq_buf, sizeof(freq_buf));
+
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now, &tm_utc);
+
+    char buf[96];
+    if (call[0]) {
+        snprintf(buf, sizeof(buf), "%s  %s\n%04d-%02d-%02d %02d:%02d UTC",
+                 call, freq_buf,
+                 tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+                 tm_utc.tm_hour, tm_utc.tm_min);
+    } else {
+        // No callsign set yet - still show date/time/freq rather than an
+        // empty line, same "something is better than a gap" reasoning as
+        // s_grid_warn's own row elsewhere in this file.
+        snprintf(buf, sizeof(buf), "%s\n%04d-%02d-%02d %02d:%02d UTC",
+                 freq_buf,
+                 tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+                 tm_utc.tm_hour, tm_utc.tm_min);
+    }
+    lv_label_set_text(s_info_lbl, buf);
 }
 
 // Refreshes s_have_me/s_my_lat/s_my_lon from storage/settings.h's my_grid.
@@ -390,6 +463,7 @@ static int gather_self_spots(self_spot_t *out, int max)
         self_spot_t *o = &out[n++];
         snprintf(o->call, sizeof(o->call), "%.15s", psk[i].call);   // see the note above
         snprintf(o->mode, sizeof(o->mode), "%.7s", psk[i].mode);
+        snprintf(o->grid, sizeof(o->grid), "%.6s", psk[i].grid);
         o->freq_hz    = psk[i].freq_hz;
         o->snr_db     = psk[i].snr_db;
         o->heard_unix = psk[i].heard_unix;
@@ -408,6 +482,7 @@ static int gather_self_spots(self_spot_t *out, int max)
         self_spot_t *o = &out[n++];
         snprintf(o->call, sizeof(o->call), "%.15s", wspr[i].call);   // see the note above
         snprintf(o->mode, sizeof(o->mode), "WSPR");
+        snprintf(o->grid, sizeof(o->grid), "%.6s", wspr[i].grid);
         o->freq_hz    = wspr[i].freq_hz;
         o->snr_db     = wspr[i].snr_db;
         o->heard_unix = wspr[i].heard_unix;
@@ -460,6 +535,7 @@ static int gather_self_spots(self_spot_t *out, int max)
  * Falls back to the old behaviour if the pane has not been laid out yet, since
  * a zero-sized read would otherwise divide the world by nothing. */
 #define MAP_RING_MIN_PX  3     /* a ring smaller than this on BOTH axes is a dot */
+#define MAP_SEG_MIN_PX   2     /* drop a point closer than this to the last one DRAWN */
 #define MAP_FIT_MARGIN_PX 24.0f    /* ~2 mm at 11.6 px/mm, each edge */
 #define MAP_FIT_FALLBACK 0.90f     /* used only before the pane has a size */
 #define MAP_FIT_MAX_ZOOM 12.0f     /* a single nearby spot must not fill the world */
@@ -796,51 +872,68 @@ static void walk_ring_segments(const lv_area_t *area, int32_t w, int32_t h, ring
             continue;                                   /* sub-pixel speck */
 
         /* ⛔ AND NOW THE HALF THE BOUNDING BOX CANNOT DO: DROP POINTS WHEN THE
-         * RING IS DRAWN SMALL. This is what froze the device.
+         * RING IS DRAWN SMALL. This is what froze the device, and a second cut
+         * at it is what un-boxed Italy - both stories below, because the second
+         * bug only exists BECAUSE of how the first one was fixed.
          *
-         * The box test rejects the several hundred tiny islands, which is the
-         * cheap half of the bill. It can do nothing about the EXPENSIVE half -
-         * at zoom 1, 248 rings still pass it and the two largest are 3,801 and
-         * 3,067 points, so a single redraw of the default view issued over ten
-         * thousand lv_draw_line calls. taskLVGL stopped keeping up, the
-         * SELFSPOTTER screen froze solid, drag and pinch stopped responding and
-         * even httpd stopped answering (operator, 2026-09-12: "Selfspotter
-         * screen seems to have frozen up completely"). I shipped the cull
-         * claiming it made the finer data affordable; it made the ZOOMED-IN
-         * case affordable and left the default view worse than before.
+         * v1 (2026-09-12): the box test rejects the several hundred tiny
+         * islands, which is the cheap half of the bill. It can do nothing about
+         * the EXPENSIVE half - at zoom 1, 248 rings still pass it and the two
+         * largest are 3,801 and 3,067 points, so a single redraw of the default
+         * view issued over ten thousand lv_draw_line calls. taskLVGL stopped
+         * keeping up, the SELFSPOTTER screen froze solid, drag and pinch
+         * stopped responding and even httpd stopped answering (operator,
+         * 2026-09-12: "Selfspotter screen seems to have frozen up completely").
+         * I shipped the cull claiming it made the finer data affordable; it
+         * made the ZOOMED-IN case affordable and left the default view worse
+         * than before. Fixed then with a per-ring pixel BUDGET (roughly one
+         * segment per two px of the ring's on-screen half-perimeter) and a
+         * fixed INDEX stride across the ring's point array to hit it.
          *
-         * So the vertex count is budgeted against the size the ring actually
-         * occupies ON SCREEN: roughly one segment per two pixels of half-
-         * perimeter, which is below what anyone can see. Antarctica at zoom 1
-         * goes from 3,801 segments to ~475.
+         * v2 (2026-09-16, operator: Italy on the map is "almost a square box"):
+         * that index stride is not shape-aware, and Natural Earth is why it
+         * mattered. Italy is NOT its own ring - like Denmark and Greece it is a
+         * peninsula, so it ships fused into one landmass polygon with the rest
+         * of Africa+Eurasia (ring 0 here, 7,707 points, bbox running from West
+         * Africa to the Bering Strait). A fixed stride picks every Nth point BY
+         * INDEX across that WHOLE ring, so a tightly-curved few hundred points
+         * describing the boot got the identical sampling rate as thousands of
+         * points along nearly-straight Siberian coastline - and because the
+         * boot is a small slice of the ring's total point count, most of the
+         * vertices that actually DEFINE its shape were exactly the ones a
+         * fixed stride skipped over.
          *
-         * ⚠ The extent is CLAMPED TO THE VISIBLE AREA first. Zoomed in, a
-         * continent's box is mostly off-screen and enormous, which would buy a
-         * budget for pixels nobody is looking at - and full detail is exactly
-         * what zooming is for, so the clamp is what keeps Scandinavia sharp
-         * while stopping the off-screen remainder from paying for it. */
-        int32_t vx0 = bx0 > area->x1 ? bx0 : area->x1;
-        int32_t vx1 = bx1 < area->x2 ? bx1 : area->x2;
-        int32_t vy0 = by0 > area->y1 ? by0 : area->y1;
-        int32_t vy1 = by1 < area->y2 ? by1 : area->y2;
-        int32_t budget = ((vx1 - vx0) + (vy1 - vy0)) / 2;
-        if (budget < 8) budget = 8;
-        int stride = (n + (int)budget - 1) / (int)budget;
-        if (stride < 1) stride = 1;
-
-        lv_point_precise_t prev = project(area, w, h,
-                                          ring->points[0] / WORLD_MAP_UNITS_PER_DEG,
-                                          ring->points[1] / WORLD_MAP_UNITS_PER_DEG);
-        /* j walks by `stride` and the final iteration is forced back to point 0,
-         * so the ring still closes however the stride divides into n. */
-        for (int j = stride; ; j += stride) {
+         * Now decimated by ON-SCREEN DISTANCE instead of index: walk every
+         * point (this file's own header on project() below already calls the
+         * arithmetic cheap - a handful of float ops; it is the DRAW CALL that
+         * is expensive) and only emit a segment once the point has moved at
+         * least MAP_SEG_MIN_PX from the last point actually drawn. A stretch
+         * that Douglas-Peucker already left sparse (long straight coast)
+         * clears that distance in one step, same cost as before. A stretch it
+         * left dense because it curves (Italy, Denmark, Greece) needs several
+         * points to cover the same screen distance and now KEEPS them, because
+         * nothing here is tied to a point's position in a 7,707-point ring.
+         * Zoomed all the way out, where whole continents used to need the
+         * budget cap to avoid the freeze above, the SAME rule self-limits: most
+         * consecutive points fall within MAP_SEG_MIN_PX of each other when a
+         * landmass is squeezed into a small on-screen box, so the segment count
+         * still collapses on its own - not because the fixed budget said so,
+         * but because that many points genuinely add nothing visible there. */
+        lv_point_precise_t last_drawn = project(area, w, h,
+                                                ring->points[0] / WORLD_MAP_UNITS_PER_DEG,
+                                                ring->points[1] / WORLD_MAP_UNITS_PER_DEG);
+        for (int j = 1; ; j++) {
             bool last = (j >= n);
             int k = (last ? 0 : j) * 2;
             lv_point_precise_t cur = project(area, w, h,
                                              ring->points[k]     / WORLD_MAP_UNITS_PER_DEG,
                                              ring->points[k + 1] / WORLD_MAP_UNITS_PER_DEG);
-            cb((int32_t)prev.x, (int32_t)prev.y, (int32_t)cur.x, (int32_t)cur.y);
-            prev = cur;
+            int32_t dx = (int32_t)cur.x - (int32_t)last_drawn.x;
+            int32_t dy = (int32_t)cur.y - (int32_t)last_drawn.y;
+            if (!last && dx * dx + dy * dy < MAP_SEG_MIN_PX * MAP_SEG_MIN_PX)
+                continue;   /* too close to the last drawn point to be visible */
+            cb((int32_t)last_drawn.x, (int32_t)last_drawn.y, (int32_t)cur.x, (int32_t)cur.y);
+            last_drawn = cur;
             if (last) break;
         }
     }
@@ -1208,6 +1301,52 @@ static void map_pinch_poll_cb(lv_timer_t *t)
         s_map_pinch_active = true;
         s_map_pinch_start_dist = dist;
         s_map_pinch_start_zoom = s_map_zoom;
+        /* ⭐ WHERE THE ZOOM IS ANCHORED, captured ONCE when the pinch starts.
+         *
+         * This used to change s_map_zoom and nothing else, so the zoom was
+         * anchored on the STATION (project()'s ax/ay) and everything else flew
+         * away from it. Operator, 2026-09-18: "it does not stay centred where i
+         * start pinching - so when zooming in i move fast to another place in
+         * the region and need to zoom out again to orient my self".
+         *
+         * ⚠ He asked whether the one-finger pan was fighting it. It is not -
+         * map_drag_cb() returns while s_map_pinch_active, and has since the
+         * gesture was written. The pan was simply never updated to match.
+         *
+         * ⛔ TAKEN FROM LVGL, NOT FROM THE RAW TOUCH DRIVER. The pinch reads
+         * esp_lcd_touch directly because LVGL tracks only one point, and those
+         * raw coordinates are in the PANEL's portrait frame - ui.c's own pinch
+         * uses `coords[].y` as a landscape x for exactly that reason. Deriving
+         * the full rotation here would be a second copy of that transform, and
+         * a wrong one would be invisible: the map would simply drift the wrong
+         * way. LVGL's tracked point is already in screen coordinates, which is
+         * what map_drag_cb() uses two functions down, so the two gestures agree
+         * by construction. It is one finger of the two rather than their
+         * midpoint - a few tens of pixels out, against a whole screen of drift
+         * before. */
+        s_map_pinch_fx = s_map_pinch_fy = 0.5f;   /* centre if nothing better */
+        if (s_map_have_last_pt && s_map_obj) {
+            lv_area_t a;
+            lv_obj_get_coords(s_map_obj, &a);
+            int32_t aw = lv_area_get_width(&a), ah = lv_area_get_height(&a);
+            if (aw > 0 && ah > 0) {
+                float fx = (float)(s_map_last_pt.x - a.x1) / (float)aw;
+                float fy = (float)(s_map_last_pt.y - a.y1) / (float)ah;
+                if (fx >= 0.0f && fx <= 1.0f && fy >= 0.0f && fy <= 1.0f) {
+                    s_map_pinch_fx = fx;
+                    s_map_pinch_fy = fy;
+                }
+            }
+        }
+        /* ⚠ KEPT, at DEBUG. This is the one line that distinguishes "the anchor
+         * is wrong" from "the anchor never arrived", and the difference is
+         * invisible on screen - the first version of this fix took the centre
+         * fallback on every pinch and looked exactly like no fix at all. It is
+         * DEBUG rather than INFO so it does not fill the diag log, and rather
+         * than deleted because the next person to touch this gesture will want
+         * it. Raise it to ESP_LOGI for one build if the map ever drifts again. */
+        ESP_LOGD(TAG, "pinch anchor: %.2f,%.2f (%s)", (double)s_map_pinch_fx,
+                 (double)s_map_pinch_fy, s_map_have_last_pt ? "finger" : "CENTRE FALLBACK");
         return;
     }
 
@@ -1215,6 +1354,27 @@ static void map_pinch_poll_cb(lv_timer_t *t)
     if (zoom < MAP_ZOOM_MIN) zoom = MAP_ZOOM_MIN;
     if (zoom > MAP_ZOOM_MAX) zoom = MAP_ZOOM_MAX;
     if (fabsf(zoom - s_map_zoom) > 0.01f) {
+        /* Hold the point under the fingers still. project() maps a world
+         * fraction w to the screen as
+         *      f = a + (w - a) * zoom + pan
+         * so for the screen point f to name the same w after the zoom changes:
+         *      w - a = (f - a - pan0) / z0
+         *      pan1  = f - a - (f - a - pan0) * z1 / z0
+         *
+         * ⚠ z0 is read as 1.0 below MAP_ZOOM_MIN because project() skips the
+         * whole transform at zoom 1 - treating the unzoomed view as
+         * (zoom 1, pan 0) is what makes the first pinch out of it land right
+         * rather than jumping. */
+        float z0 = (s_map_zoom > 1.0f) ? s_map_zoom : 1.0f;
+        float p0x = (s_map_zoom > 1.0f) ? s_map_pan_dx : 0.0f;
+        float p0y = (s_map_zoom > 1.0f) ? s_map_pan_dy : 0.0f;
+        float ax = ((s_have_me ? (float)s_my_lon : 0.0f) + 180.0f) / 360.0f;
+        float ay = (90.0f - (s_have_me ? (float)s_my_lat : 0.0f)) / 180.0f;
+        float r  = zoom / z0;
+
+        s_map_pan_dx = s_map_pinch_fx - ax - (s_map_pinch_fx - ax - p0x) * r;
+        s_map_pan_dy = s_map_pinch_fy - ay - (s_map_pinch_fy - ay - p0y) * r;
+
         s_map_zoom = zoom;
         s_view_is_users = true;    /* stop auto-re-fitting under their fingers */
         map_sync_scroll_chain();   /* pan, or swipe-to-tab - see its comment */
@@ -1266,9 +1426,31 @@ static void map_drag_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
         s_map_drag_active = false;
+        s_map_have_last_pt = false;   /* never anchor the next pinch on an old touch */
         return;
     }
     if (code != LV_EVENT_PRESSING) return;
+
+    /* ⛔ READ THE POINT BEFORE ANY EARLY RETURN - THE PINCH NEEDS IT.
+     *
+     * map_pinch_poll_cb() runs from an lv_timer, and lv_indev_get_act() is only
+     * valid INSIDE an event callback, so from there it is always NULL. My first
+     * attempt at anchoring the pinch asked for it anyway, silently fell back to
+     * the screen centre every single time, and the operator reported exactly
+     * that: "its still zooming around the center of the screen".
+     *
+     * Here the indev is the event's own and is always valid. Storing it on
+     * every PRESSING - including the ones the drag itself ignores, which is why
+     * this sits above the returns below - means that when a second finger lands
+     * the pinch already knows where the first one is. */
+    {
+        lv_indev_t *iv = lv_event_get_indev(e);
+        if (iv) {
+            lv_indev_get_point(iv, &s_map_last_pt);
+            s_map_have_last_pt = true;
+        }
+    }
+
     if (s_map_zoom <= MAP_ZOOM_MIN || s_map_pinch_active) {
         s_map_drag_active = false;   // re-baseline once dragging is valid again
         return;
@@ -1302,6 +1484,15 @@ static void map_drag_cb(lv_event_t *e)
 // ---- Tabelle tab --------------------------------------------------------
 
 #define COL_GAP 10
+/* How many characters the Country column can show before country_display()
+ * gives up and returns the 3-letter code instead. The columns are flex-grow,
+ * so this is a judgement about the RENDERED width rather than a derivation -
+ * if a common country starts showing as a code, this is the number to raise
+ * (and something else must give a grow unit back). */
+/* The LIST tab is the widest place a country name is shown - 1280 px with only
+ * a 140 px tab bar beside it - so it gets the generous limit. The FT8 and WSPR
+ * decode lists are far tighter and pass their own, smaller number. */
+#define LIST_COUNTRY_CHARS 18
 /* ⛔ THE SAME UNBOUNDED-COST BUG THE MAP HAD, NOW FOUND IN THE LIST.
  *
  * This used to be SELF_SPOT_MAX (300) - "the buffer is the limit, nothing
@@ -1368,7 +1559,7 @@ static void add_col(lv_obj_t *row, const char *text, int grow, uint32_t color, b
 // direction.
 typedef enum {
     SORT_COL_NONE = 0,
-    SORT_COL_CALL, SORT_COL_MODE, SORT_COL_BAND, SORT_COL_ISO,
+    SORT_COL_CALL, SORT_COL_GRID, SORT_COL_MODE, SORT_COL_BAND, SORT_COL_ISO,
     SORT_COL_FREQ, SORT_COL_SNR, SORT_COL_DIST, SORT_COL_AGE,
 } sort_col_t;
 typedef enum { SORT_ASC, SORT_DESC } sort_dir_t;
@@ -1397,6 +1588,7 @@ static int cmp_spots(const void *pa, const void *pb)
     int cmp;
     switch (s_sort_col) {
     case SORT_COL_CALL: cmp = strcasecmp(a->call, b->call); break;
+    case SORT_COL_GRID: cmp = strcasecmp(a->grid, b->grid); break;
     case SORT_COL_MODE: cmp = strcasecmp(a->mode, b->mode); break;
     // Band has no numeric value of its own (it's a name derived from
     // frequency, adif_log_band_for_freq()) - sorting on the underlying
@@ -1408,8 +1600,12 @@ static int cmp_spots(const void *pa, const void *pb)
     // same as the column's own render below - not stored on self_spot_t, so
     // it is looked up here rather than compared as a field.
     case SORT_COL_ISO: {
-        const char *ia = geo_coords_iso_for_call(a->call);
-        const char *ib = geo_coords_iso_for_call(b->call);
+        /* Sorted on what is SHOWN, so the order matches the column the operator
+         * is reading - country_display() spells the name out where it fits and
+         * falls back to the 3-letter code where it does not, and sorting on the
+         * underlying ISO would have put "Spain" and "ESP" in different places. */
+        const char *ia = country_display(a->call, LIST_COUNTRY_CHARS);
+        const char *ib = country_display(b->call, LIST_COUNTRY_CHARS);
         if (!ia || !ib) { cmp = (!ia == !ib) ? 0 : (ia ? -1 : 1); break; }
         cmp = strcmp(ia, ib);
         break;
@@ -1511,14 +1707,56 @@ static void rebuild_table(void)
     // RX/Freq could shrink and Distance grow by whole-number steps and still
     // land on the same total (20 vs 10) - see add_col()'s own comment for why
     // SNR/Distance also right-align.
-    add_sort_header_col(hdr, "RX",       4, SORT_COL_CALL,  false);
-    add_sort_header_col(hdr, "Mode",     2, SORT_COL_MODE,  true);
-    add_sort_header_col(hdr, "Band",     2, SORT_COL_BAND,  true);
-    add_sort_header_col(hdr, "Freq",     3, SORT_COL_FREQ,  true);
-    add_sort_header_col(hdr, "SNR",      2, SORT_COL_SNR,   true);
-    add_sort_header_col(hdr, "Distance", 3, SORT_COL_DIST,  true);
-    add_sort_header_col(hdr, "ISO",      2, SORT_COL_ISO,   true);
-    add_sort_header_col(hdr, "Age",      2, SORT_COL_AGE,   true);
+/* ⭐ CAPITALS AND ONE COMMON ORDER ACROSS ALL THREE LISTS (operator,
+     * 2026-09-19). FT8, this list and WSPR now read left to right as
+     * WHO - WHERE - WHAT - HOW WELL - HOW FAR - HOW LONG AGO, so the eye
+     * lands in the same place on every screen:
+     *   FT8   CALL MESSAGE COUNTRY SNR TONE DT KM AGE
+     *   LIST  RECEIVER GRID COUNTRY MODE BAND FREQUENCY SNR KM AGE
+     *   WSPR  S UTC CALL GRID COUNTRY BND PWR SNR TONE DR DT KM
+     *
+     * ⚠ TONE AND DT ARE NOT HERE, AND THAT IS THE DATA'S FAULT, NOT AN
+     * OVERSIGHT. The operator asked for both. No feed reports the audio tone
+     * we were heard on - PSK Reporter and RBN give a dial frequency, wsprnet
+     * gives ours as they measured it, none gives an offset within a passband -
+     * and DT exists only in the wsprnet scrape, i.e. one source of three. A
+     * column that is a dash on two thirds of the rows is worse than no column,
+     * and inventing either would be the "never fabricate a measurement" rule
+     * again. Add them the day a feed actually carries them.
+     *
+     * Weights total 24 (was 21): GRID takes 3 and RECEIVER gives up one, since
+     * "RECEIVER" is a wider heading than "RX" but the CALLSIGNS under it did
+     * not change length. */
+/* ⚠ WEIGHTS DOUBLED so the columns can be tuned in HALF steps. At the old
+     * 2/3/4 granularity the smallest change was ~4 % of the table width, which
+     * is why GRID ended up a character short of a 6-character locator and
+     * FREQUENCY clipped (operator, 2026-09-19: "GRID and FREQUENCY columns are
+     * not wide enough - look at last line in GRID").
+     *
+     * What the values have to hold, which is what these are sized from:
+     *   RECEIVER  a callsign, up to ~10 with a portable suffix
+     *   GRID      SIX characters - a 6-char locator is normal, not an edge case
+     *   FREQUENCY "14.095.600" - ten characters in the dotted style
+     *   SNR       "-19"   KM "12.345"   AGE "5m"
+     * SNR, KM and AGE are the three narrowest things in the table and were
+     * each as wide as GRID; they give up the room. */
+    add_sort_header_col(hdr, "RECEIVER",  8, SORT_COL_CALL,  false);
+    add_sort_header_col(hdr, "GRID",      6, SORT_COL_GRID,  false);
+    /* Country BEFORE Distance - operator, 2026-09-19. Reads better: the country
+     * names it, the distance qualifies it, and the two numeric columns (Freq,
+     * SNR) no longer have a text column wedged between them and Distance.
+     *
+     * LEFT-aligned, like its values. */
+    add_sort_header_col(hdr, "COUNTRY",   6, SORT_COL_ISO,   false);
+    add_sort_header_col(hdr, "MODE",      4, SORT_COL_MODE,  true);
+    add_sort_header_col(hdr, "BAND",      4, SORT_COL_BAND,  true);
+    add_sort_header_col(hdr, "FREQUENCY",10, SORT_COL_FREQ,  true);
+    add_sort_header_col(hdr, "SNR",       3, SORT_COL_SNR,   true);
+    /* The UNIT lives in the heading now, not on every row - the same trade the
+     * FT8 and WSPR lists already make. */
+    add_sort_header_col(hdr, settings_get_distance_in_miles() ? "MI" : "KM",
+                                          4, SORT_COL_DIST,  true);
+    add_sort_header_col(hdr, "AGE",       3, SORT_COL_AGE,   true);
 
     static EXT_RAM_BSS_ATTR self_spot_t spots[SELF_SPOT_MAX];   // NOT internal .bss - see the note above map_draw_cb()'s copy of this array
     int count = gather_self_spots(spots, SELF_SPOT_MAX);
@@ -1535,18 +1773,31 @@ static void rebuild_table(void)
         char freq_buf[16], age_buf[24], snr_buf[8], dist_buf[24];
         format_freq_hz(sp->freq_hz, g_freq_style, freq_buf, sizeof(freq_buf));
         format_age(sp->heard_unix, now, age_buf, sizeof(age_buf));
-        snprintf(snr_buf, sizeof(snr_buf), "%d dB", sp->snr_db);
+        snprintf(snr_buf, sizeof(snr_buf), "%d", sp->snr_db);
         if (sp->distance_km >= 0) {
-            char km_dotted[16];
-            format_km_dotted((long)sp->distance_km, km_dotted, sizeof(km_dotted));
-            snprintf(dist_buf, sizeof(dist_buf), "%s km", km_dotted);
+            // Randy N4OPI, 2026-09-16: the FT8 decode list already honours
+            // distance_in_miles (ft8_screen_view.c) - this table never did,
+            // and always showed km regardless of the setting. Same conversion
+            // as that screen (km * 0.621371), formatted with the same
+            // thousands-dotted style either way.
+            char dist_dotted[16];
+            bool mi = settings_get_distance_in_miles();
+            long shown = mi ? (long)(sp->distance_km * 0.621371 + 0.5) : (long)sp->distance_km;
+            format_km_dotted(shown, dist_dotted, sizeof(dist_dotted));
+            snprintf(dist_buf, sizeof(dist_buf), "%s", dist_dotted);
         } else {
             snprintf(dist_buf, sizeof(dist_buf), "-");
         }
         // The ONE band table (adif_log_band_for_freq(), adif_log.c) - do not
         // reimplement this locally, see that function's own comment.
         const char *band = adif_log_band_for_freq(sp->freq_hz);
-        const char *iso = geo_coords_iso_for_call(sp->call);
+        /* ⛔ COUNTRY, NOT ISO. This column showed a 3-letter code while the FT8
+         * and WSPR lists spell the name out - two answers to the same question
+         * in one firmware. Operator, 2026-09-19: "In LIST tap we have ISO....
+         * in all other pages we have COUNTRY". country_display() is the single
+         * rule those pages already use: the name where it fits, the 3-letter
+         * code where it does not, and NEVER a name chopped in half. */
+        const char *iso = country_display(sp->call, LIST_COUNTRY_CHARS);
 
         lv_obj_t *row = make_row(s_table_list);
         /* ⛔ THE MODE COLUMN IS COLOURED BY THE MODE, NOT BY THE SOURCE.
@@ -1567,7 +1818,7 @@ static void rebuild_table(void)
          * what the sidebar's three checkboxes are the legend for - one column
          * per meaning, and no colour describing something it is not. */
         uint32_t col = source_color(sp->src);
-        add_col(row, sp->call[0] ? sp->call : "-", 4, col, true, false);
+        add_col(row, sp->call[0] ? sp->call : "-", 8, col, true, false);
         /* ⛔ ui_theme_mode_color() WAS THE WRONG FIX. Operator, 2026-09-12:
          * "The Mode text in the LIST tap is almost invisible - make text same
          * colour as Band". Cause found rather than guessed: that helper has no
@@ -1579,13 +1830,14 @@ static void rebuild_table(void)
          * mode colour" to add instead - it is a protocol on top of DiGi, not a
          * QMX CAT mode - so the plain, correct answer is the one asked for:
          * the same neutral UI_COLOR_TEXT the Band column already uses. */
-        add_col(row, sp->mode[0] ? sp->mode : "-", 2, UI_COLOR_TEXT, false, true);
-        add_col(row, band[0] ? band : "-", 2, UI_COLOR_TEXT, false, true);
-        add_col(row, freq_buf, 3, UI_COLOR_TEXT, false, true);
-        add_col(row, snr_buf, 2, UI_COLOR_TEXT, false, true);
-        add_col(row, dist_buf, 3, UI_COLOR_TEXT_SECONDARY, false, true);
-        add_col(row, iso ? iso : "-", 2, UI_COLOR_TEXT_SECONDARY, false, true);
-        add_col(row, age_buf, 2, UI_COLOR_TEXT_SECONDARY, false, true);
+        add_col(row, sp->grid[0] ? sp->grid : "-", 6, UI_COLOR_TEXT_SECONDARY, false, false);
+        add_col(row, iso ? iso : "-", 6, UI_COLOR_TEXT_SECONDARY, false, false);
+        add_col(row, sp->mode[0] ? sp->mode : "-", 4, UI_COLOR_TEXT, false, true);
+        add_col(row, band[0] ? band : "-", 4, UI_COLOR_TEXT, false, true);
+        add_col(row, freq_buf, 10, UI_COLOR_TEXT, false, true);
+        add_col(row, snr_buf, 3, UI_COLOR_TEXT, false, true);
+        add_col(row, dist_buf, 4, UI_COLOR_TEXT_SECONDARY, false, true);
+        add_col(row, age_buf, 3, UI_COLOR_TEXT_SECONDARY, false, true);
         shown++;
     }
 
@@ -1823,6 +2075,32 @@ static void tabview_changed_cb(lv_event_t *e)
     (void)e;
     if (!s_tabview) return;
     uint32_t active = lv_tabview_get_tab_active(s_tabview);
+
+    /* ⛔ NO SWIPE OFF THE MAP. The whole map page is a pan surface, so a drag
+     * across it is nearly always someone moving the map - and a tabview changes
+     * tab by scrolling its own content sideways, so the two gestures are the
+     * same gesture. Operator, 2026-09-18: "I want to zoom into New Zealand and
+     * while panning down there the page tends to swipe to LIST instead - its
+     * fighting the swipe feature".
+     *
+     * ⚠ map_sync_scroll_chain() already gave up the HORIZONTAL chain while
+     * zoomed, and it was not enough: it only covers a press that lands on
+     * s_map_obj itself, and only the horizontal axis, while a mostly-vertical
+     * drag still carries enough sideways motion for the tabview to claim it.
+     * Turning the content's own scrollability off is the whole-page answer and
+     * does not depend on which child was pressed.
+     *
+     * ⭐ ONE DIRECTION ONLY, which is what makes this safe: it is switched off
+     * while MAP is showing and back on everywhere else, so LIST -> CONDITIONS,
+     * CONDITIONS -> LIST and LIST -> MAP all still swipe exactly as before.
+     * The only journey that loses its gesture is the one that was fighting the
+     * map, and the tab bar on the left is right there for it - a button, which
+     * cannot be confused with a pan. */
+    lv_obj_t *content = lv_tabview_get_content(s_tabview);
+    if (content) {
+        if (active == 0) lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+        else             lv_obj_add_flag  (content, LV_OBJ_FLAG_SCROLLABLE);
+    }
 
     // Zoom only means anything on MAP - operator, 2026-09-13: "the zoom
     // dropdown shall be greyed out when not useful in LIST and CONDITIONS".
@@ -2079,7 +2357,28 @@ static void build_settings_drawer(lv_obj_t *parent)
     lv_obj_set_flex_flow(sb, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(sb, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(sb, 20, 0);
-    lv_obj_clear_flag(sb, LV_OBJ_FLAG_SCROLLABLE);
+    // ⛔ THIS WAS THE SAME "PANEL HEIGHT IS ONE BUDGET" BUG CLAUDE.md ALREADY
+    // WARNS ABOUT, IN A NEW PLACE. Scrolling was cleared here, and by the time
+    // the Age section (label + checkbox + the "bright/faded" key) was added
+    // below the three Source checkboxes, the drawer's own content ran to
+    // roughly 718 px against 656 px of actual height (SCR_H - HEADER_H, minus
+    // top/bottom padding) - a ~62 px overrun that landed almost exactly on
+    // Flush, at the very bottom. With scrolling off there was no scrollbar to
+    // even hint that more content existed: Flush was not hidden, not moved,
+    // just silently clipped and permanently unreachable. Operator, 2026-09-16,
+    // looking straight at a screenshot ending at "faded = older": "I might be
+    // blind - but where is the flush button right now?" He was not blind -
+    // scrolling was OFF, so there was truly nothing further to find.
+    // Re-enabled rather than shrinking content to fit THIS session's row
+    // count: the next Source/Age row added would only reopen the same gap.
+    // settings_swipe_cb's open/close gesture (above) tracks horizontal drag
+    // distance only (dx) and fires from PRESSED/PRESSING/RELEASED events that
+    // LVGL delivers to this object regardless of its own scroll state, so a
+    // sideways swipe to close the drawer and an up/down scroll inside it
+    // cannot conflict - and add_filter_checkbox() already clears
+    // LV_OBJ_FLAG_SCROLL_CHAIN_VER on each row, so a tap ON a checkbox still
+    // cannot be mistaken for a drag on the drawer around it.
+    lv_obj_set_scrollbar_mode(sb, LV_SCROLLBAR_MODE_AUTO);
 
     // User Manual + Need Guidance - same two doors the main drawer offers,
     // same order, so this panel reads as a drawer rather than a stranger.
@@ -2114,20 +2413,16 @@ static void build_settings_drawer(lv_obj_t *parent)
     lv_obj_set_style_pad_top(lbl, 6, 0);
     lv_label_set_text(lbl, "Source");
 
-    add_filter_checkbox(sb, "CW (RBN)",    MAP_SRC_COLOR_CW,   cw_cb);
-    add_filter_checkbox(sb, "Digi (PSKR)", MAP_SRC_COLOR_DIGI, digi_cb);
-    add_filter_checkbox(sb, "WSPR",        MAP_SRC_COLOR_WSPR, wspr_cb);
+    add_filter_checkbox(sb, "CW (RBN)",    UI_COLOR_MODE_CW,   cw_cb);
+    add_filter_checkbox(sb, "Digi (PSKR)", UI_COLOR_MODE_DIGI, digi_cb);
+    add_filter_checkbox(sb, "WSPR",        UI_COLOR_MODE_WSPR, wspr_cb);
 
-    /* Age, below the three SOURCE boxes and visually separated from them,
-     * because it filters a different axis: those three say WHERE a spot came
-     * from, this one says WHEN. Drawn in muted text rather than a source
-     * colour for the same reason - it is not a fourth source. */
-    lv_obj_t *age_lbl = lv_label_create(sb);
-    lv_label_set_text(age_lbl, "Age");
-    lv_obj_set_style_text_font(age_lbl, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(age_lbl, lv_color_hex(UI_COLOR_TEXT_MUTED), 0);
-    lv_obj_set_style_pad_top(age_lbl, 10, 0);
-
+    // "Age" heading REMOVED (operator, 2026-09-16: "remove the text line Age
+    // and move up the Older >30 min") - it filters a different axis than the
+    // three Source rows above it (WHEN a spot arrived, not WHERE it came
+    // from), but that distinction did not need its own row once the panel was
+    // already tight on vertical room. The checkbox's own label still says
+    // "Older >30 min", which carries the same meaning on its own.
     add_filter_checkbox(sb, "Older >30 min", UI_COLOR_TEXT_SECONDARY, older_cb);
 
     /* Says what the dimming MEANS. The map draws older spots at a third of the
@@ -2145,28 +2440,25 @@ static void build_settings_drawer(lv_obj_t *parent)
     lv_obj_set_width(s_grid_warn, SIDEBAR_W - 28);
     lv_obj_set_style_pad_top(s_grid_warn, 10, 0);
     lv_label_set_text(s_grid_warn, "");   // filled in by refresh, see refresh_timer_cb
+    // HIDDEN when empty (the common case - a grid square is normally set),
+    // not just empty-texted. A flex child still claims a row for its own
+    // empty-string line height plus this label's own 10 px pad_top even with
+    // nothing to show, and that is exactly the blank line the operator saw
+    // sitting between the "bright/faded" key text above and Flush below
+    // ("remove the line space between the helping grey text and the Flush
+    // button") - LVGL's flex layout skips a HIDDEN object entirely, which a
+    // merely-empty one does not get. refresh_timer_cb toggles this flag in
+    // the same place it sets the text, so a grid square typed in later still
+    // makes the real warning reappear and claim its row back.
+    lv_obj_add_flag(s_grid_warn, LV_OBJ_FLAG_HIDDEN);
 
-    // A one-child row of its own, centered - the drawer's own flex cross-
-    // align is START (so the checkboxes/labels above hug the left edge),
-    // and that applies to every direct child alike. Centering just this one
-    // button needs its own centered flex row rather than fighting the
-    // drawer's container-wide alignment.
-    lv_obj_t *flush_wrap = lv_obj_create(sb);
-    lv_obj_remove_style_all(flush_wrap);
-    lv_obj_set_size(flush_wrap, SIDEBAR_W - 28, LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_top(flush_wrap, 14, 0);
-    lv_obj_set_flex_flow(flush_wrap, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(flush_wrap, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(flush_wrap, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *flush_btn = lv_button_create(flush_wrap);
-    lv_obj_set_style_bg_color(flush_btn, lv_color_hex(UI_COLOR_DANGER), 0);
-    lv_obj_set_style_pad_hor(flush_btn, 16, 0);
-    lv_obj_set_height(flush_btn, 52);
-    lv_obj_add_event_cb(flush_btn, flush_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *flush_lbl = lv_label_create(flush_btn);
-    lv_obj_set_style_text_font(flush_lbl, &lv_font_montserrat_24, 0);
-    lv_label_set_text(flush_lbl, "Flush");
+    /* ⛔ THE DRAWER'S OWN FLUSH BUTTON IS GONE (2026-09-17, operator's call).
+     * Uwe DL8UG's header button does the same job - it calls this same
+     * flush_btn_cb() - and is reachable without opening the drawer at all,
+     * which was his whole reason for adding it. Two entry points to one
+     * destructive action is one more than the screen needs.
+     *
+     * flush_btn_cb() itself stays: it is now the header button's callback. */
 
     /* The handle, a CHILD of the drawer on its LEFT edge - the edge that
      * travels - copied from ui.c's s_drawer_grip. ⛔ Not on the screen edge:
@@ -2407,6 +2699,7 @@ static void refresh_timer_cb(lv_timer_t *t)
     (void)t;
     if (!s_active) return;
 
+    update_info_line();
     refresh_own_position();
 
     // A spot fades when it passes 30 min even if nothing new arrives - redraw
@@ -2450,6 +2743,10 @@ static void refresh_timer_cb(lv_timer_t *t)
     if (s_grid_warn) {
         lv_label_set_text(s_grid_warn, s_have_me ? "" :
             "No home grid square set (Settings -> My Grid) - the map cannot draw any lines.");
+        // See its own comment at creation - hidden (not just empty-texted)
+        // so it claims no flex row when there is nothing to warn about.
+        if (s_have_me) lv_obj_add_flag(s_grid_warn, LV_OBJ_FLAG_HIDDEN);
+        else            lv_obj_clear_flag(s_grid_warn, LV_OBJ_FLAG_HIDDEN);
     }
 
     // Band conditions update roughly hourly - fetched_ms is the same cheap
@@ -2497,7 +2794,10 @@ static void exit_btn_cb(lv_event_t *e)
  *    already computes on every fresh open, so selecting it just re-runs that
  *    same function rather than jumping to some particular zoom value.
  *
- * Picking x1..x10 marks the view as the operator's (s_view_is_users = true),
+ * Extended to x20/x50, 2026-09-16, matching MAP_ZOOM_MAX's own second raise -
+ * same reasoning, this list must never fall short of what pinching can reach.
+ *
+ * Picking x1..x50 marks the view as the operator's (s_view_is_users = true),
  * same as a pinch would - a deliberate zoom choice should not be silently
  * overridden the next time a new spot arrives (see s_view_is_users's own
  * comment). It does NOT track live pinch zoom back onto itself - the
@@ -2507,7 +2807,7 @@ static void zoom_dropdown_cb(lv_event_t *e)
 {
     lv_obj_t *dd = lv_event_get_target(e);
     uint32_t idx = lv_dropdown_get_selected(dd);
-    static const float kZoom[] = { 0.0f /* Fit */, 1, 2, 3, 4, 5, 10 };
+    static const float kZoom[] = { 0.0f /* Fit */, 1, 2, 3, 4, 5, 10, 20, 50 };
     if (idx >= sizeof(kZoom) / sizeof(kZoom[0])) return;
     if (idx == 0) {
         s_view_is_users = false;   /* map_fit_to_spots() sets it back anyway - explicit for clarity */
@@ -2571,6 +2871,35 @@ void spot_map_view_init(lv_obj_t *parent)
     lv_obj_set_style_border_color(hdr, lv_color_hex(UI_COLOR_BORDER), 0);
     lv_obj_clear_flag(hdr, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* ---- THE HEADER IS ONE BUDGET, NOT FOUR ANCHORS -----------------------
+     * Zoom was anchored to the header's CENTRE while Flush and Exit were
+     * anchored to its RIGHT edge and the ID line to its LEFT - so inserting
+     * Flush moved nothing and simply drew over the ID line (Gyula HA3HZ's
+     * callsign/time/frequency, added in v1.14.2). Three origins, no shared
+     * budget, and the collision was invisible until a screenshot with a
+     * callsign actually set.
+     *
+     * All four now sit on ONE run with EQUAL gaps, laid out left to right
+     * from the title's right edge to the right margin. Widths are measured,
+     * not guessed - Exit and Flush from a pixel scan of a live screenshot.
+     *
+     *   run   = HDR_RUN_R - HDR_RUN_L            = 1256 - 256 = 1000
+     *   items = 254 (zoom) + 193 + 138 + 102     = 687
+     *   gap   = (1000 - 687) / 4                 = 78
+     *
+     * Add or resize anything here and the gap recomputes itself. */
+    #define HDR_RUN_L     256   /* right edge of "SELFSPOTTER" (montserrat_32) */
+    #define HDR_RUN_R    1256   /* SCR_W - 24 right margin */
+    #define ZOOM_GRP_W    254   /* ZOOM_LBL_W + ZOOM_GAP + ZOOM_DD_W, below */
+    #define INFO_GAP_W    193
+    #define FLUSH_BTN_W   138   /* measured: trash glyph + "Flush" + 2*20 pad */
+    #define EXIT_BTN_W    102   /* measured: x=1147..1249 on a live screenshot */
+    #define HDR_GAP  (((HDR_RUN_R - HDR_RUN_L) - (ZOOM_GRP_W + INFO_GAP_W +                        FLUSH_BTN_W + EXIT_BTN_W)) / 4)
+    #define ZOOM_X   (HDR_RUN_L + HDR_GAP)
+    #define INFO_GAP_X (ZOOM_X + ZOOM_GRP_W + HDR_GAP)
+    #define FLUSH_X  (INFO_GAP_X + INFO_GAP_W + HDR_GAP)
+    #define EXIT_X   (FLUSH_X + FLUSH_BTN_W + HDR_GAP)
+
     lv_obj_t *title = lv_label_create(hdr);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(UI_COLOR_ACCENT_GOLD), 0);
@@ -2581,7 +2910,7 @@ void spot_map_view_init(lv_obj_t *parent)
     // area can reach below the 64 px bar - same reasoning as reader_view.c's
     // header buttons (LVGL clips a child's hit area to its parent).
     lv_obj_t *exit_btn = lv_button_create(s_overlay);
-    lv_obj_align(exit_btn, LV_ALIGN_TOP_RIGHT, -24, (HEADER_H - 46) / 2);
+    lv_obj_align(exit_btn, LV_ALIGN_TOP_LEFT, EXIT_X, (HEADER_H - 46) / 2);
     lv_obj_set_style_bg_color(exit_btn, lv_color_hex(UI_COLOR_SURFACE), 0);
     lv_obj_set_style_pad_hor(exit_btn, 20, 0);
     lv_obj_set_height(exit_btn, 46);
@@ -2592,6 +2921,38 @@ void spot_map_view_init(lv_obj_t *parent)
     lv_obj_t *exit_lbl = lv_label_create(exit_btn);
     lv_obj_set_style_text_font(exit_lbl, &lv_font_montserrat_24, 0);
     lv_label_set_text(exit_lbl, LV_SYMBOL_CLOSE "  Exit");
+
+    // Flush - same header-bar treatment as Exit (child of the OVERLAY for the
+    // same extended-hit-area reason), sat directly left of it via align_to so
+    // it never depends on Exit's own content-sized width. Reuses
+    // flush_btn_cb() - the same "empty all three self-spot ring buffers"
+    // action the settings-drawer Flush button already has; this is a second,
+    // quicker-to-reach way to trigger it, not a replacement for that one.
+    lv_obj_t *flush_hdr_btn = lv_button_create(s_overlay);
+    // align_to(exit_btn, OUT_LEFT_MID) was tried first and measured wrong on
+    // real hardware TWICE, overlapping Exit both times (operator: "muss
+    // weiter nach links geschoben werden ... etwas höher align mit dem exit
+    // button") - a pixel-level screenshot check (/ss.bmp, scanning for the
+    // button's own background colour) found exit_btn's rendered box at
+    // x=1147..1249, y=9..56, while align_to had placed flush's right edge at
+    // x=1219 and its vertical band at y=19..64 - both badly off, and adding
+    // lv_obj_update_layout(exit_btn) right before the align_to call (the
+    // fix adif_view_modal.c/ft8_filter_modal.c use for a lazily-sized
+    // sibling) made no measurable difference on a re-flash, so the problem
+    // isn't (only) that. Rather than keep guessing against align_to's
+    // timing, this uses the SAME fixed TOP_RIGHT-of-s_overlay recipe
+    // exit_btn itself uses - identical y formula, so vertical match is
+    // exact instead of inferred, and an x offset sized from exit_btn's
+    // MEASURED width (-24 right edge, ~109 px wide) plus a 20 px gap.
+    lv_obj_align(flush_hdr_btn, LV_ALIGN_TOP_LEFT, FLUSH_X, (HEADER_H - 46) / 2);
+    lv_obj_set_style_bg_color(flush_hdr_btn, lv_color_hex(UI_COLOR_DANGER), 0);
+    lv_obj_set_style_pad_hor(flush_hdr_btn, 20, 0);
+    lv_obj_set_height(flush_hdr_btn, 46);
+    lv_obj_set_ext_click_area(flush_hdr_btn, 44);
+    lv_obj_add_event_cb(flush_hdr_btn, flush_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *flush_hdr_lbl = lv_label_create(flush_hdr_btn);
+    lv_obj_set_style_text_font(flush_hdr_lbl, &lv_font_montserrat_24, 0);
+    lv_label_set_text(flush_hdr_lbl, LV_SYMBOL_TRASH "  Flush");
 
     // Zoom - centered in the header, same lv_dropdown + montserrat_28 +
     // "fix the popup list's own font" recipe every other dropdown in this
@@ -2611,18 +2972,65 @@ void spot_map_view_init(lv_obj_t *parent)
     lv_label_set_text(zoom_lbl, "Zoom:");
     lv_obj_set_style_text_font(zoom_lbl, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(zoom_lbl, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
-    lv_obj_align(zoom_lbl, LV_ALIGN_TOP_MID,
-                 -(ZOOM_DD_W / 2 + ZOOM_GAP + ZOOM_LBL_W / 2), HEADER_H / 2 - 14);
+    lv_obj_align(zoom_lbl, LV_ALIGN_LEFT_MID, ZOOM_X, 0);
 
     lv_obj_t *zoom_dd = lv_dropdown_create(hdr);
-    lv_dropdown_set_options(zoom_dd, "Fit\nx1\nx2\nx3\nx4\nx5\nx10");
+    lv_dropdown_set_options(zoom_dd, "Fit\nx1\nx2\nx3\nx4\nx5\nx10\nx20\nx50");
     lv_obj_set_size(zoom_dd, ZOOM_DD_W, 46);
-    lv_obj_align(zoom_dd, LV_ALIGN_TOP_MID, (ZOOM_LBL_W + ZOOM_GAP) / 2, (HEADER_H - 46) / 2);
+    lv_obj_align(zoom_dd, LV_ALIGN_TOP_LEFT, ZOOM_X + ZOOM_LBL_W + ZOOM_GAP, (HEADER_H - 46) / 2);
     lv_obj_set_style_text_font(zoom_dd, &lv_font_montserrat_24, 0);
     lv_dropdown_set_selected(zoom_dd, 0);   /* "Fit" - what a fresh open already does */
     lv_obj_add_event_cb(zoom_dd, zoom_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(zoom_dd, zoom_dropdown_open_cb, LV_EVENT_CLICKED, NULL);
     s_zoom_dd = zoom_dd;   // tabview_changed_cb greys this out off the MAP tab
+
+    // Callsign/freq/UTC info line - see update_info_line()'s own header
+    // comment. Sits in the free space between the Zoom group and Exit
+    // (there is no room for a second row within HEADER_H's 64 px without
+    // growing it, but there is horizontal slack here: title ends well
+    // before the centred Zoom group at x=767, and Exit starts around
+    // x=1141 - see the constants below).
+    //
+    // ⛔ FIRST VERSION used lv_obj_align_to(..., exit_btn, LV_ALIGN_OUT_LEFT_MID,
+    // ...) with the label's text set AFTER the align call, on an initially-EMPTY
+    // label. lv_obj_align_to() computes its offset from the object's size AT THE
+    // MOMENT OF THE CALL, so it anchored against a near-zero-width box; setting
+    // the real (much wider) text afterwards only grew the box to the right from
+    // that same top-left corner - landing it UNDER Exit instead of left of it
+    // (operator screenshot, 2026-09-17: text fragments visible peeking out from
+    // behind the Exit button). Fixed by giving this a FIXED width and centring
+    // text within it, positioned at a fixed gap between the two neighbours
+    // instead of measuring either one at build time - same width regardless of
+    // whether the callsign is set, so it cannot drift again if the content's
+    // own size changes later. LV_ALIGN_LEFT_MID centres it vertically in the
+    // header for free (this is a direct child of hdr, whose height IS
+    // HEADER_H, so "centred on the banner" falls out of that alignment
+    // without a separate y calculation).
+    // ⛔ THIS WIDTH IS DERIVED FROM THE FLUSH BUTTON, not chosen. Uwe DL8UG's
+    // header Flush button (added 2026-09-17) lands at x=989..1126 - measured on
+    // a live screenshot, and it matches its own geometry: right-aligned at -153
+    // in a 1280 px header, 138 px wide. At the previous width of 340 this label
+    // ran to 1120 and the button was drawn straight over its right-hand third,
+    // clipping the callsign and the time - which is the whole content Gyula
+    // HA3HZ asked for in v1.14.2 ("a screenshot with no callsign/time/freq in
+    // it doesn't convey much information"). One contributor's feature silently
+    // ate another's, and only a screenshot with a callsign SET shows it, which
+    // is why it reached me and not him.
+    //
+    // 193 = 989 (Flush's left edge) - 16 (gap) - 780 (this label's own x). Move
+    // the button and this must move with it.
+    /* INFO_GAP_X / INFO_GAP_W come from the header budget above. */
+    lv_obj_t *info_lbl = lv_label_create(hdr);
+    lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(info_lbl, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+    lv_obj_set_style_text_align(info_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(info_lbl, INFO_GAP_W);
+    /* Wrap, never clip - the same rule the Calibrate Power modal needed on the
+     * same day. A long compound callsign must push a line, not lose one. */
+    lv_label_set_long_mode(info_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_align(info_lbl, LV_ALIGN_LEFT_MID, INFO_GAP_X, 0);
+    s_info_lbl = info_lbl;
+    update_info_line();
 
     build_settings_drawer(s_overlay);
     build_settings_scrim(s_overlay);
@@ -2631,6 +3039,14 @@ void spot_map_view_init(lv_obj_t *parent)
     lv_obj_t *tv = lv_tabview_create(s_overlay);
     s_tabview = tv;   // map_pinch_poll_cb() needs to know when MAP is the visible tab
     lv_obj_add_event_cb(tv, tabview_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    /* ⛔ AND RUN IT ONCE NOW. VALUE_CHANGED has not fired yet, but MAP is
+     * already the tab on screen - so without this the FIRST swipe off the map
+     * still worked and the fix only took effect after the operator had changed
+     * tab by hand at least once. Same shape as the top-bar bug this project has
+     * now had three times: a state that must hold for a whole mode belongs in
+     * something re-derived, and the entry path with no transition is the one
+     * that gets missed. */
+    tabview_changed_cb(NULL);
     /* ⛔ FULL WIDTH NOW - the checkbox sidebar is gone (build_settings_drawer()
      * above is a separate, hidden-by-default panel reached by the edge swipe),
      * so lv_tabview's OWN tab bar, moved to the left, is the only thing
@@ -2739,6 +3155,13 @@ void spot_map_view_init(lv_obj_t *parent)
 
     lv_obj_move_foreground(hdr);
     lv_obj_move_foreground(exit_btn);
+    lv_obj_move_foreground(flush_hdr_btn);   // same reason as exit_btn just above - built
+                                              // before the tabview, so without this the
+                                              // tabview content draws OVER it and it's
+                                              // invisible - caught on hardware (operator:
+                                              // "ich sehe den button nicht"), not by reading
+                                              // the code, exactly like the exit_btn/hdr case
+                                              // the comment below already describes.
     /* The settings drawer + its edge strip must sit above the tabview content
      * for the same reason hdr/exit_btn do - built after it, so without this
      * they would be UNDER it in the child list and lose every hit test. The

@@ -93,6 +93,22 @@ void  ui_set_zoom(float zoom, int pan_bins); // set zoom+pan, persists zoom to N
  * leaving it at a screen edge (Roy KI0ER). Call it BEFORE the tune; it is
  * consumed by the next frequency update, whatever that turns out to be. */
 void ui_note_frequency_jump(void);
+/* Stronger: the VIEW was dragged, so it re-frames on the new dial
+ * unconditionally - no fits-test, no push/land. See ui.c. */
+void ui_note_view_reframe(void);
+
+/* Put the visible window's CENTRE at view_center_hz. Pans without touching the
+ * radio while the requested window is inside what it can hear, and retunes by
+ * exactly the shortfall when it is not - so the window always lands where it
+ * was asked for. This is what dragging the band-plan knob does, on the Tab5 and
+ * from the web page, and the long rationale is at bp_solve_view() in ui.c.
+ * Returns the dial it settled on.
+ *
+ * ⛔ LVGL-THREAD ONLY. Anything off taskLVGL - the web server above all - must
+ * call ui_request_bandplan_view() instead, which queues it for the LVGL thread.
+ * See the comment above that function in ui.c. */
+uint32_t ui_bandplan_move_view(int64_t view_center_hz);
+void ui_request_bandplan_view(int64_t view_center_hz);
 
 void ui_set_still_view(bool on);
 bool ui_get_still_view(void);

@@ -5,6 +5,7 @@
 #include "sd_archive.h"
 
 #include <string.h>
+#include <strings.h>   // strncasecmp - band names are matched case-INSENSITIVELY
 #include <stdint.h>
 #include <time.h>   // time(NULL) - power-calibration row timestamp
 
@@ -78,6 +79,7 @@ static const char *TAG = "settings";
 #define KEY_WF_CONTRAST  "wf_contr"
 #define KEY_WF_BLEND     "wf_blend"
 #define KEY_WF_WINDOW    "wf_window"
+#define KEY_WF_SPEED     "wf_speed"
 #define KEY_DISP_FLIP    "disp_flip"
 #define KEY_QMX_VOL      "qmx_vol_db"
 #define KEY_CW_TX_OFF    "cw_tx_off"
@@ -117,11 +119,14 @@ static const char *TAG = "settings";
 #define KEY_WSPR_DIAL      "wspr_dial"
 #define KEY_WSPR_TX_EN     "wspr_tx_en"
 #define KEY_WSPR_DUTY      "wspr_duty"
+#define KEY_WSPR_BURST     "wspr_burst"
+#define KEY_WSPR_SCHED_V   "wspr_schedv"   /* 1 = tx/rx cycle counts; absent = old "1 in N" + bursts */
 #define KEY_WSPR_DBM       "wspr_dbm"
 #define KEY_WSPR_PARED     "wspr_pared"
 #define KEY_WSPR_PASAVE    "wspr_pasave"
 #define KEY_PWR_CAL        "pwrcal"
 #define KEY_PWR_TARGET     "pwrtarget"
+#define KEY_WSPR_TONE      "wsprtone"
 #define KEY_WSPR_DUMP      "wspr_dump"
 #define KEY_WSPR_HOPM      "wspr_hopm"
 #define KEY_WSPR_HOPE      "wspr_hope"
@@ -169,6 +174,7 @@ static const char *TAG = "settings";
 #define DEF_WF_CONTRAST   (45.0f)
 #define DEF_WF_BLEND      (100)
 #define DEF_WF_WINDOW     (0)
+#define DEF_WF_SPEED      (1)
 #define DEF_CHARGE_LIM_EN  (false)
 #define DEF_CHARGE_LIM_PCT (80)
 #define DEF_RELAY_PIN      (53)
@@ -373,6 +379,9 @@ static inline bool dirty_test_any(const dirty_t *d, const uint8_t *bits, size_t 
 #define DIRTY_SPOTMAP_EN    118   /* spot map + its three self-spot feeds */
 #define DIRTY_PWR_CAL        119  /* power calibration table (Calibrate Power) - NOT in config export, see the type's comment */
 #define DIRTY_PWR_TARGET     120  /* operator's own per-band Output power target - a preference, unlike DIRTY_PWR_CAL */
+#define DIRTY_WF_SPEED       121
+#define DIRTY_WSPR_BURST     122  /* consecutive cycles per scheduled WSPR transmission */
+#define DIRTY_WSPR_TONE      123  /* pinned WSPR TX tone, 0 = random per burst */
 
 // Bits that actually affect config_io_export()'s output (storage/config_io.c).
 // Bookkeeping bits like DIRTY_LAST_TIME (rewritten every FT8 slot by the
@@ -546,6 +555,7 @@ static void flush_task(void *arg)
         if (dirty_test(&dirty_local, DIRTY_WF_CONTRAST)) nvs_set_float(KEY_WF_CONTRAST, snap.wf_contrast_db);
         if (dirty_test(&dirty_local, DIRTY_WF_BLEND))    nvs_set_u8(s_nvs, KEY_WF_BLEND,  snap.wf_floor_blend);
         if (dirty_test(&dirty_local, DIRTY_WF_WINDOW))   nvs_set_u8(s_nvs, KEY_WF_WINDOW, snap.wf_window);
+        if (dirty_test(&dirty_local, DIRTY_WF_SPEED))    nvs_set_u8(s_nvs, KEY_WF_SPEED,  snap.wf_speed_mult);
         if (dirty_test(&dirty_local, DIRTY_DISP_FLIP))   nvs_set_u8(s_nvs, KEY_DISP_FLIP, snap.display_flip ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_QMX_VOL))     nvs_set_u8(s_nvs, KEY_QMX_VOL,   snap.qmx_vol_db);
         if (dirty_test(&dirty_local, DIRTY_CW_TX_OFFSET)) nvs_set_i16(s_nvs, KEY_CW_TX_OFF, snap.cw_tx_offset_hz);
@@ -599,8 +609,12 @@ static void flush_task(void *arg)
         if (dirty_test(&dirty_local, DIRTY_SIM_MODE))     nvs_set_u8(s_nvs, KEY_SIM_MODE, snap.sim_mode_en ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_WSPR_DIAL))    nvs_set_u32(s_nvs, KEY_WSPR_DIAL, snap.wspr_dial_hz);
         if (dirty_test(&dirty_local, DIRTY_WSPR_TX_EN))   nvs_set_u8(s_nvs, KEY_WSPR_TX_EN, snap.wspr_tx_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_DUTY))    nvs_set_u8(s_nvs, KEY_WSPR_DUTY, snap.wspr_duty_pct);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_DUTY))  { nvs_set_u8(s_nvs, KEY_WSPR_DUTY, snap.wspr_rx_cycles);
+                                                          nvs_set_u8(s_nvs, KEY_WSPR_SCHED_V, 1); }
+        if (dirty_test(&dirty_local, DIRTY_WSPR_BURST)) { nvs_set_u8(s_nvs, KEY_WSPR_BURST, snap.wspr_tx_cycles);
+                                                          nvs_set_u8(s_nvs, KEY_WSPR_SCHED_V, 1); }
         if (dirty_test(&dirty_local, DIRTY_WSPR_DBM))     nvs_set_i8(s_nvs, KEY_WSPR_DBM, snap.wspr_tx_dbm);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_TONE))    nvs_set_u16(s_nvs, KEY_WSPR_TONE, snap.wspr_tx_tone_hz);
         if (dirty_test(&dirty_local, DIRTY_WSPR_PA)) {
             nvs_set_u8(s_nvs, KEY_WSPR_PARED, snap.wspr_pa_reduce ? 1 : 0);
             nvs_set_u16(s_nvs, KEY_WSPR_PASAVE, snap.wspr_pa_saved_x10);
@@ -785,6 +799,7 @@ static void load_from_nvs(qmx_settings_t *out)
     out->wf_contrast_db = DEF_WF_CONTRAST;
     out->wf_floor_blend = DEF_WF_BLEND;
     out->wf_window      = DEF_WF_WINDOW;
+    out->wf_speed_mult  = DEF_WF_SPEED;
     out->display_flip   = false;
     out->qmx_vol_db     = 20;   // fallback slider position only - never sent at boot
     out->ft8_early_decode = true; // on by default (WSJT-X-style fast pounce timing)
@@ -841,8 +856,10 @@ static void load_from_nvs(qmx_settings_t *out)
     out->sim_mode_en = false;
     out->wspr_dial_hz  = 14095600u;   /* 20 m, the busiest WSPR band */
     out->wspr_tx_en    = false;       /* TX off until deliberately enabled */
-    out->wspr_duty_pct = 5;           /* 1 in 5 - closest match to the old "20%" default */
+    out->wspr_rx_cycles = 4;          /* 1 transmit + 4 receive = 10 min, 20% - the long-standing default */
+    out->wspr_tx_cycles = 1;
     out->wspr_tx_dbm   = 23;          /* what the code claimed before this was settable */
+    out->wspr_tx_tone_hz = 0;         /* 0 = random per burst, the default */
     out->wspr_pa_reduce = true;       /* #290 - protecting the finals is the safe default */
     out->wspr_pa_saved_x10 = 0;       /* nothing outstanding to restore */
     out->wspr_dump_cycles = 0;        /* never dump unless asked */
@@ -979,8 +996,10 @@ static void load_from_nvs(qmx_settings_t *out)
     if (nvs_get_float(KEY_WF_CONTRAST, &fv)) out->wf_contrast_db = fv;
     nvs_get_u8(s_nvs, KEY_WF_BLEND,  &out->wf_floor_blend);
     nvs_get_u8(s_nvs, KEY_WF_WINDOW, &out->wf_window);
+    nvs_get_u8(s_nvs, KEY_WF_SPEED,  &out->wf_speed_mult);
     if (out->wf_floor_blend > 100) out->wf_floor_blend = 100;
     if (out->wf_window > 2)        out->wf_window = 0;
+    if (out->wf_speed_mult < 1 || out->wf_speed_mult > 4) out->wf_speed_mult = DEF_WF_SPEED;
     if (nvs_get_u8(s_nvs, KEY_DISP_FLIP, &u8v) == ESP_OK) out->display_flip = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_QMX_VOL, &u8v) == ESP_OK) out->qmx_vol_db = (u8v <= 199) ? u8v : 199;
     {
@@ -1079,29 +1098,57 @@ static void load_from_nvs(qmx_settings_t *out)
     if (nvs_get_u8(s_nvs, KEY_SIM_MODE, &u8v) == ESP_OK) out->sim_mode_en = (u8v != 0);
     { uint32_t u32v; if (nvs_get_u32(s_nvs, KEY_WSPR_DIAL, &u32v) == ESP_OK) out->wspr_dial_hz = u32v; }
     if (nvs_get_u8(s_nvs, KEY_WSPR_TX_EN, &u8v) == ESP_OK) out->wspr_tx_en = (u8v != 0);
-    if (nvs_get_u8(s_nvs, KEY_WSPR_DUTY, &u8v) == ESP_OK) {
-        /* ⛔ MIGRATE THE OLD PERCENTAGE SCALE, DO NOT LET IT LEAK THROUGH AS A
-         * PERIOD. This field's meaning changed 2026-09-12 from "chance per
-         * cycle, 0-50" to "literal 1-in-N period" (operator: "No % but only 1
-         * in 2, 1 in 3, 1 in 4, 1 in 5, 1 in 10 ... this way ... operator knows
-         * the TX plan"). roll_next_tx_cycle() now does a bare `after + duty`,
-         * so a stored 50 (used to mean "roughly half the cycles") would
-         * silently become "one cycle in fifty" - 100 minutes idle instead of
-         * frequent bursts, with no error and no visible cause. The five values
-         * below are the ONLY ones the old UI could ever have written (kDuty[]
-         * had exactly these five options), so the mapping is exhaustive, not a
-         * guess: higher percentage (more frequent) maps to smaller N (more
-         * frequent), preserving what the operator actually chose. Anything
-         * else (should not occur) falls back to 5 rather than an unbounded N. */
-        static const uint8_t legacy_from[] = { 0, 10, 20, 33, 50 };
-        static const uint8_t legacy_to[]   = { 0, 10,  5,  3,  2 };
-        bool known = false;
-        for (size_t i = 0; i < sizeof(legacy_from); i++) {
-            if (u8v == legacy_from[i]) { out->wspr_duty_pct = legacy_to[i]; known = true; break; }
+    /* ---- WSPR schedule: two cycle counts, migrated from "1 in N" + bursts ----
+     *
+     * ⛔ THE STORED BYTES ARE AMBIGUOUS WITHOUT THE VERSION MARKER, and this
+     * field has already changed meaning once before (percentage -> "1 in N",
+     * 2026-09-12), so reinterpreting in place is exactly the trap that
+     * migration was written to avoid. A stored duty of 5 means "one cycle in
+     * five", i.e. FOUR receive cycles - read as the new field directly it would
+     * become five, and every unit would quietly slip from a 10-minute period to
+     * 12 with nothing to see.
+     *
+     * The mapping is exact rather than approximate: the old period was
+     * duty + bursts - 1, and tx = bursts, rx = duty - 1 reproduces it
+     * cycle-for-cycle. A unit that upgrades keeps the schedule it had.
+     *
+     * duty == 0 was the dropdown's "Receive only" row, which is now
+     * wspr_tx_cycles == 0. */
+    {
+        uint8_t ver = 0;
+        (void)nvs_get_u8(s_nvs, KEY_WSPR_SCHED_V, &ver);
+        uint8_t stored_rx = 0, stored_tx = 0;
+        bool have_rx = (nvs_get_u8(s_nvs, KEY_WSPR_DUTY,  &stored_rx) == ESP_OK);
+        bool have_tx = (nvs_get_u8(s_nvs, KEY_WSPR_BURST, &stored_tx) == ESP_OK);
+
+        if (ver >= 1) {
+            if (have_rx) out->wspr_rx_cycles = (stored_rx >= 1 && stored_rx <= 20) ? stored_rx : 4;
+            if (have_tx) out->wspr_tx_cycles = (stored_tx <= 4) ? stored_tx : 1;
+        } else if (have_rx || have_tx) {
+            /* Old semantics. The 2026-09-12 percentage migration ran on read
+             * and was never version-stamped, so a unit can still hold a raw
+             * percentage here; fold that in first, with the same exhaustive
+             * table, then convert to cycle counts. */
+            uint8_t duty = have_rx ? stored_rx : 5;
+            static const uint8_t legacy_from[] = { 10, 20, 33, 50 };
+            static const uint8_t legacy_to[]   = { 10,  5,  3,  2 };
+            for (size_t i = 0; i < sizeof(legacy_from); i++)
+                if (duty == legacy_from[i]) { duty = legacy_to[i]; break; }
+
+            uint8_t bursts = (have_tx && stored_tx >= 1 && stored_tx <= 4) ? stored_tx : 1;
+            if (duty == 0) {
+                out->wspr_tx_cycles = 0;            /* the old "Receive only" row */
+                out->wspr_rx_cycles = 4;
+            } else {
+                if (duty < 2)  duty = 2;            /* period 1 would be continuous TX */
+                if (duty > 21) duty = 21;
+                out->wspr_tx_cycles = bursts;
+                out->wspr_rx_cycles = (uint8_t)(duty - 1);
+            }
         }
-        if (!known) out->wspr_duty_pct = (u8v == 0) ? 0 : 5;
     }
     { int8_t i8v; if (nvs_get_i8(s_nvs, KEY_WSPR_DBM, &i8v) == ESP_OK) out->wspr_tx_dbm = i8v; }
+    { uint16_t u16v; if (nvs_get_u16(s_nvs, KEY_WSPR_TONE, &u16v) == ESP_OK) out->wspr_tx_tone_hz = u16v; }
     { uint8_t u8v; if (nvs_get_u8(s_nvs, KEY_WSPR_PARED, &u8v) == ESP_OK) out->wspr_pa_reduce = (u8v != 0); }
     { uint16_t u16v; if (nvs_get_u16(s_nvs, KEY_WSPR_PASAVE, &u16v) == ESP_OK) out->wspr_pa_saved_x10 = u16v; }
     { uint8_t u8v; if (nvs_get_u8(s_nvs, KEY_WSPR_DUMP, &u8v) == ESP_OK) out->wspr_dump_cycles = u8v; }
@@ -1451,6 +1498,19 @@ void settings_set_cq_max_calls(uint8_t n)
     mark_dirty(DIRTY_CQ_MAX_CALLS);
 }
 
+// Narrow (#409): ft8_qso.c's rearm_current() reads this from whatever task
+// re-arms a CQ run, which now includes the httpd worker task via the web
+// tone-apply path - see settings_get_sim_mode_en()'s comment for the crash
+// this class of bug produces.
+uint8_t settings_get_cq_max_calls(void)
+{
+    if (!s_ready) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.cq_max_calls;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
 void settings_set_hound_mode(uint8_t m)
 {
     if (!s_ready) return;
@@ -1515,13 +1575,34 @@ void settings_set_pwr_cal_band(const char *band, const uint8_t voltage_x10[PWRCA
                                 const uint16_t watts_x100[PWRCAL_STEPS])
 {
     if (!s_ready || !band || !band[0] || !voltage_x10 || !watts_x100) return;
+    /* ⛔ A SWEEP WITH NO POINTS CLEARS THE BAND, it does not store an empty row.
+     * The config import needs a way to REMOVE a calibration - "20m =" with
+     * nothing after it - and a row whose band name is set but whose voltages
+     * are all zero is worse than no row: it occupies a slot, it is invisible to
+     * the export (which skips rows with no points), and it makes the band look
+     * calibrated to anything that only checks band[0]. */
+    bool has_point = false;
+    for (int k = 0; k < PWRCAL_STEPS; k++) if (voltage_x10[k]) { has_point = true; break; }
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     pwr_cal_table_t *t = &s_pending.pwr_cal;
     int slot = -1, oldest = -1;
     for (int i = 0; i < PWRCAL_MAX_BANDS; i++) {
-        if (strncmp(t->bands[i].band, band, sizeof(t->bands[i].band)) == 0) { slot = i; break; }
+        /* ⛔ CASE-INSENSITIVE. adif_log_band_for_freq() returns "20M", but a
+         * config file is hand-edited and "20m" is what anyone would type.
+         * strncmp() made those two DIFFERENT bands, so an edited file silently
+         * grew a duplicate row the firmware would never look at. Caught on the
+         * bench 2026-09-18 by round-tripping the export through the import. */
+        if (strncasecmp(t->bands[i].band, band, sizeof(t->bands[i].band)) == 0) { slot = i; break; }
         if (t->bands[i].band[0] == '\0' && slot < 0) slot = i;  // first empty, keep looking for an exact match
         if (oldest < 0 || t->bands[i].cal_unix_time < t->bands[oldest].cal_unix_time) oldest = i;
+    }
+    if (!has_point) {
+        /* Clear an EXISTING row; never allocate a slot just to blank it. */
+        if (slot >= 0 && t->bands[slot].band[0]) memset(&t->bands[slot], 0, sizeof(t->bands[slot]));
+        xSemaphoreGive(s_mutex);
+        mark_dirty(DIRTY_PWR_CAL);
+        return;
     }
     if (slot < 0) slot = oldest;  // table full and this band isn't in it - replace the stalest row
     pwr_cal_band_t *row = &t->bands[slot];
@@ -1542,7 +1623,7 @@ bool settings_get_pwr_cal_band(const char *band, uint8_t voltage_x10[PWRCAL_STEP
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     const pwr_cal_table_t *t = &s_pending.pwr_cal;
     for (int i = 0; i < PWRCAL_MAX_BANDS; i++) {
-        if (strncmp(t->bands[i].band, band, sizeof(t->bands[i].band)) == 0) {
+        if (strncasecmp(t->bands[i].band, band, sizeof(t->bands[i].band)) == 0) {
             if (voltage_x10) memcpy(voltage_x10, t->bands[i].voltage_x10, sizeof(t->bands[i].voltage_x10));
             if (watts_x100)  memcpy(watts_x100,  t->bands[i].watts_x100,  sizeof(t->bands[i].watts_x100));
             found = true;
@@ -1560,8 +1641,17 @@ void settings_set_pwr_target_watts(const char *band, uint16_t watts_x100)
     pwr_target_table_t *t = &s_pending.pwr_target;
     int slot = -1;
     for (int i = 0; i < PWRCAL_MAX_BANDS; i++) {
-        if (strncmp(t->bands[i].band, band, sizeof(t->bands[i].band)) == 0) { slot = i; break; }
+        /* Case-insensitive for the same reason as the calibration table above. */
+        if (strncasecmp(t->bands[i].band, band, sizeof(t->bands[i].band)) == 0) { slot = i; break; }
         if (t->bands[i].band[0] == '\0' && slot < 0) slot = i;
+    }
+    if (watts_x100 == 0) {
+        /* Zero watts is not a target, it is "no preference on this band" - so
+           it removes the row rather than storing a target of nothing. */
+        if (slot >= 0 && t->bands[slot].band[0]) memset(&t->bands[slot], 0, sizeof(t->bands[slot]));
+        xSemaphoreGive(s_mutex);
+        mark_dirty(DIRTY_PWR_TARGET);
+        return;
     }
     if (slot < 0) slot = 0;   /* table somehow full of distinct bands - overwrite the first rather than drop the write */
     strncpy(t->bands[slot].band, band, sizeof(t->bands[slot].band) - 1);
@@ -1578,7 +1668,7 @@ bool settings_get_pwr_target_watts(const char *band, uint16_t *watts_x100)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     const pwr_target_table_t *t = &s_pending.pwr_target;
     for (int i = 0; i < PWRCAL_MAX_BANDS; i++) {
-        if (strncmp(t->bands[i].band, band, sizeof(t->bands[i].band)) == 0) {
+        if (strncasecmp(t->bands[i].band, band, sizeof(t->bands[i].band)) == 0) {
             if (watts_x100) *watts_x100 = t->bands[i].target_w_x100;
             found = true;
             break;
@@ -1863,6 +1953,17 @@ void settings_set_wf_window(uint8_t idx)
     mark_dirty(DIRTY_WF_WINDOW);
 }
 
+void settings_set_wf_speed_mult(uint8_t mult)
+{
+    if (!s_ready) return;
+    if (mult < 1 || mult > 4) mult = DEF_WF_SPEED;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.wf_speed_mult == mult) { xSemaphoreGive(s_mutex); return; }
+    s_pending.wf_speed_mult = mult;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_WF_SPEED);
+}
+
 void settings_set_display_flip(bool v)
 {
     if (!s_ready) return;
@@ -1904,6 +2005,16 @@ void settings_set_cq_listen_every(uint8_t n)
     s_pending.cq_listen_every = n;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_CQ_LISTEN);
+}
+
+// Narrow, same reason as settings_get_cq_max_calls() (#409).
+uint8_t settings_get_cq_listen_every(void)
+{
+    if (!s_ready) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.cq_listen_every;
+    xSemaphoreGive(s_mutex);
+    return v;
 }
 
 void settings_set_cluster_en(bool v)
@@ -2062,6 +2173,65 @@ bool settings_get_wspr_tx_en(void)
     return v;
 }
 
+// Narrow: wspr_rx_start() applies the declared power the moment WSPR takes
+// ownership of Max. PA voltage, and runs on taskLVGL via ui_set_base_mode().
+/* Narrow, for the same reason every other getter here is: the declared-power
+ * apply runs on the LVGL thread and on the WSPR slot loop, and a whole
+ * qmx_settings_t on either stack is this project's most-repeated crash. */
+uint32_t settings_get_wspr_dial_hz(void)
+{
+    if (!s_ready) return 14095600u;   /* the field's own default - 20 m */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint32_t v = s_pending.wspr_dial_hz;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+uint16_t settings_get_wspr_tx_tone_hz(void)
+{
+    if (!s_ready) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint16_t v = s_pending.wspr_tx_tone_hz;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_set_wspr_tx_tone_hz(uint16_t hz)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_pending.wspr_tx_tone_hz = hz;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_WSPR_TONE);
+}
+
+int8_t settings_get_wspr_tx_dbm(void)
+{
+    if (!s_ready) return 23;   /* the field's own default - 200 mW */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int8_t v = s_pending.wspr_tx_dbm;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+// Narrow on purpose (#409, 2026-09-17): ft8_tx_arm() used to declare a whole
+// qmx_settings_t on its own stack just to read this one bool, in its Digi
+// pre-flight. That function runs on WHATEVER task called ft8_tx_arm() -
+// taskLVGL and the CAT poll task normally, but also the httpd worker task
+// (10 KB stack) when the web UI's tone-apply POST re-arms a running QSO at
+// a new tone. Randy N4OPI: picking a new tone and hitting Apply while a QSO
+// was ARMED (not actively transmitting) rebooted the Tab5 every time on two
+// benches - exactly this task/stack combination. See CLAUDE.md's "Task
+// stacks on this board are TINY" - this is the fourth settings_load_all()
+// caught doing it, not the first.
+bool settings_get_sim_mode_en(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.sim_mode_en;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
 // Narrow on purpose: the drawer callback and the feed tasks that read this are
 // on stacks that cannot afford a whole qmx_settings_t local - see CLAUDE.md's
 // "Task stacks on this board are TINY", where that mistake has landed four
@@ -2120,13 +2290,24 @@ bool settings_get_sota_en(void)
     return v;
 }
 
-uint8_t settings_get_wspr_duty_pct(void)
+uint8_t settings_get_wspr_tx_cycles(void)
 {
-    if (!s_ready) return 0;
+    if (!s_ready) return 1;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    uint8_t v = s_pending.wspr_duty_pct;
+    uint8_t v = s_pending.wspr_tx_cycles;
     xSemaphoreGive(s_mutex);
-    return v;
+    return (v <= 4) ? v : 1;   /* 0 is legitimate here: receive only */
+}
+
+uint8_t settings_get_wspr_rx_cycles(void)
+{
+    if (!s_ready) return 4;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.wspr_rx_cycles;
+    xSemaphoreGive(s_mutex);
+    /* Never 0. A group with no receive cycles keys the radio continuously and
+     * the page never receives - measured on the bench, see settings.h. */
+    return (v >= 1 && v <= 20) ? v : 4;
 }
 
 uint16_t settings_get_wspr_pa_saved_x10(void)
@@ -2594,14 +2775,27 @@ void settings_set_wspr_tx_en(bool v)
     mark_dirty(DIRTY_WSPR_TX_EN);
 }
 
-void settings_set_wspr_duty_pct(uint8_t v)
+void settings_set_wspr_rx_cycles(uint8_t v)
 {
     if (!s_ready) return;
+    if (v < 1)  v = 1;    /* 0 would be continuous transmit - see settings.h */
+    if (v > 20) v = 20;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (s_pending.wspr_duty_pct == v) { xSemaphoreGive(s_mutex); return; }
-    s_pending.wspr_duty_pct = v;
+    if (s_pending.wspr_rx_cycles == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.wspr_rx_cycles = v;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_WSPR_DUTY);
+}
+
+void settings_set_wspr_tx_cycles(uint8_t v)
+{
+    if (!s_ready) return;
+    if (v > 4) v = 4;   /* four consecutive cycles is ~8 minutes of key-down */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.wspr_tx_cycles == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.wspr_tx_cycles = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_WSPR_BURST);
 }
 
 void settings_set_wspr_dump_cycles(uint8_t v)

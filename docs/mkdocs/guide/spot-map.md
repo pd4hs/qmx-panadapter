@@ -37,6 +37,10 @@ page you were on, and **Exit** (top right) closes it. A Bluetooth keyboard's
 The button works from the panadapter, FT8 and WSPR pages alike — the drawer
 itself opens the same way from any of them (swipe in from the right edge).
 
+The header shows your **callsign, dial frequency, and the current UTC date and
+time** — so a screenshot of the map stands on its own without needing anything
+else to say when or where it was taken.
+
 There is nothing to switch on first — the feeds have been running since boot
 (see below), so the map is never starting from a cold, empty world.
 
@@ -58,9 +62,11 @@ what other people have already published about you.
 A report stays on the map for **half an hour**, then drops off. The map is a
 picture of who is hearing you *now*.
 
-The **Source** checkboxes in the left sidebar show or hide each one. **Flush**
-empties the map immediately so you can start a fresh picture — it does not stop
-any of the feeds, they simply begin filling it again.
+The **Source** checkboxes in the left sidebar show or hide each one. **Flush**,
+in the header beside **Exit**, empties the map immediately so you can start a
+fresh picture — useful when you change band. It does not stop any of the feeds;
+they simply begin filling it again. *(Contributed by Uwe DL8UG. It was in the
+sidebar until v1.14.4.)*
 
 ---
 
@@ -74,15 +80,18 @@ quiet stretch still shows what was heard recently. Your own position is a dot,
 drawn on top of everything.
 
 - **Drag** with one finger to pan.
-- **Pinch** with two fingers to zoom, up to 8×. Zoom is anchored on your own
+- **Pinch** with two fingers to zoom, up to 50×. Zoom is anchored on your own
   station, so your QTH stays put while the world grows around it.
 
-**LIST** is the same data as a table — receiver, mode, band, frequency, SNR,
-distance, age and **ISO** (the receiving station's country) — when you want the
-numbers rather than the picture. Every column is sortable; tap a header to
-sort by it. The ISO column names the *country*, which can differ from the
-DXCC entity the map itself plots — a Hawaiian station's marker sits on Hawaii,
-but its ISO reads `USA`.
+**LIST** is the same data as a table — **RECEIVER, GRID, COUNTRY, MODE, BAND,
+FREQUENCY, SNR, KM** and **AGE** — when you want the numbers rather than the
+picture. Every column is sortable; tap a header to sort by it.
+
+**GRID** is the locator the receiving station itself sent, not one worked
+backwards from a position, so it is blank for CW skimmers: they report a
+callsign and not a location. **COUNTRY** names the *country*, which can differ
+from the DXCC entity the map plots — a Hawaiian station's marker sits on
+Hawaii, while its country reads United States.
 
 **CONDITIONS** is HF propagation from hamqsl.com: day and night ratings per band
 group, plus solar flux, A and K index, sunspot number, geomagnetic field and
